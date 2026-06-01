@@ -51,26 +51,14 @@ type RelayOverview = {
     createdAt: string;
     pendingCount: number;
     pendingBytes: number;
-    oldestPendingAt: string | null;
-    newestPendingAt: string | null;
-    expiresNextAt: string | null;
   }>;
   pendingMessages: Array<{
     id: string;
     queueId: string;
-    clientMessageId?: string;
-    envelopeVersion: number;
     ciphertextHash: string;
     byteSize: number;
     createdAt: string;
     expiresAt: string;
-  }>;
-  hourlyMetrics: Array<{
-    bucketAt: string;
-    metricHash: string;
-    enqueuedCount: number;
-    deliveredCount: number;
-    expiredCount: number;
   }>;
 };
 
@@ -81,6 +69,9 @@ type AppState = {
   inviteText: string;
   messageText: string;
   log: string[];
+  autoReceive: boolean;
+  isPolling: boolean;
+  lastPollAt?: string;
   ops?: RelayOverview;
   backup?: VaultBackup;
   historyKey?: CryptoKey;
@@ -88,6 +79,8 @@ type AppState = {
   db?: IDBDatabase;
   invite?: Invite;
 };
+
+let pollTimer: number | undefined;
 
 function defaultRelayUrl() {
   const configured = import.meta.env.VITE_RELAY_URL as string | undefined;
@@ -101,143 +94,130 @@ const state: AppState = {
   adminToken: 'zuri-demo-admin',
   role: null,
   inviteText: '',
-  messageText: 'Oi, testando o Chat Zuri Seguro.',
+  messageText: '',
   log: [],
+  autoReceive: true,
+  isPolling: false,
 };
 
 render();
+syncPolling();
 
 function render() {
-  const canChat = Boolean(state.invite && state.role && state.chatKey && state.historyKey && state.db);
-  const myName = state.role === 'a' ? 'Pessoa A' : state.role === 'b' ? 'Pessoa B' : 'Ninguem conectado';
-  const peerName = state.role === 'a' ? 'Pessoa B' : 'Pessoa A';
+  const canChat = isReady();
+  const myName = state.role === 'a' ? 'Você: Alice' : state.role === 'b' ? 'Você: Bianca' : 'Sem sessão';
+  const peerName = state.role === 'a' ? 'Bianca' : 'Alice';
+  const peerSubtitle = canChat
+    ? state.autoReceive ? 'online · recebimento automático' : 'online · recebimento manual'
+    : 'aguardando convite seguro';
 
   document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
-    <section class="hero">
-      <span class="eyebrow">Chat Zuri Seguro</span>
-      <h1>A conversa precisa parecer simples, mesmo quando a seguranca trabalha pesado.</h1>
-      <p>Abra esta pagina em dois navegadores. No primeiro, crie o convite. No segundo, cole o convite. Depois envie e receba mensagens sem o relay ver texto puro.</p>
-      <div class="heroLinks">
-        <a href="#start">Comecar</a>
-        <a href="#observability">Ver fila</a>
-        <a href="${escapeHtml(state.relayUrl)}/health" target="_blank" rel="noreferrer">Ver relay</a>
-      </div>
-    </section>
-
-    <section class="statusBar" aria-label="Estado da conversa">
-      <div class="${state.db ? 'ok' : ''}">
-        <strong>1</strong>
-        <span>Cofre local</span>
-      </div>
-      <div class="${state.invite ? 'ok' : ''}">
-        <strong>2</strong>
-        <span>Convite</span>
-      </div>
-      <div class="${canChat ? 'ok' : ''}">
-        <strong>3</strong>
-        <span>Conversa</span>
-      </div>
-    </section>
-
-    <section class="workspace" id="start">
-      <aside class="sidePanel">
-        <h2>Como testar com duas pessoas</h2>
-        <ol>
-          <li>Abra esta mesma URL em duas janelas ou dois navegadores.</li>
-          <li>Na janela A, clique em <strong>Criar convite</strong>.</li>
-          <li>Copie o convite e cole na janela B.</li>
-          <li>Na janela B, clique em <strong>Entrar na conversa</strong>.</li>
-          <li>Uma janela envia, a outra clica em <strong>Receber agora</strong>.</li>
-        </ol>
-        <div class="note">
-          <strong>O relay so ve:</strong>
-          <span>queue_id, tokens e ciphertext. O texto aparece apenas no navegador.</span>
-        </div>
-      </aside>
-
-      <main class="chatCard">
-        <header class="chatHeader">
+    <main class="phoneShell">
+      <aside class="contactPane">
+        <header class="contactHeader">
           <div>
-            <span>Voce esta como</span>
-            <strong>${escapeHtml(myName)}</strong>
+            <strong>Zuri Chat</strong>
+            <span>A segurança é nossa. A conversa é sua.</span>
           </div>
-          <button class="ghost" id="persist">Guardar melhor neste navegador</button>
+          <button class="iconButton" id="persist" title="Guardar melhor neste navegador">↧</button>
         </header>
 
-        <section class="setupGrid">
-          <div class="setupBox">
-            <h3>Janela A</h3>
-            <p>Cria uma conversa nova e gera um convite para a outra pessoa.</p>
-            <label>Relay
-              <input id="relayUrl" value="${escapeHtml(state.relayUrl)}" />
-            </label>
+        <section class="setupCard">
+          <h2>Começar conversa</h2>
+          <p>Use duas janelas. Uma cria o convite; a outra cola e entra.</p>
+          <label>Relay
+            <input id="relayUrl" value="${escapeHtml(state.relayUrl)}" />
+          </label>
+          <div class="setupActions">
             <button id="createInvite">Criar convite</button>
+            <button class="secondary" id="copyInvite" ${state.invite ? '' : 'disabled'}>Copiar</button>
           </div>
-
-          <div class="setupBox">
-            <h3>Janela B</h3>
-            <p>Cola o convite recebido para entrar na mesma conversa.</p>
-            <label>Convite recebido
-              <textarea id="inviteInput" placeholder="Cole aqui o convite da Pessoa A">${escapeHtml(state.inviteText)}</textarea>
-            </label>
-            <button id="joinInvite">Entrar na conversa</button>
-          </div>
+          <label>Convite recebido
+            <textarea id="inviteInput" placeholder="Cole aqui o convite da outra pessoa">${escapeHtml(state.inviteText)}</textarea>
+          </label>
+          <button class="secondary" id="joinInvite">Entrar na conversa</button>
         </section>
 
-        ${state.invite ? `
-          <section class="inviteBox">
-            <div>
-              <h3>Convite desta conversa</h3>
-              <p>Use este bloco para abrir a segunda janela. Em produto real isso vira link/QR Code com expiracao.</p>
-            </div>
-            <textarea readonly id="inviteOutput">${escapeHtml(encodeInvite(state.invite))}</textarea>
-            <button id="copyInvite">Copiar convite</button>
-          </section>
-        ` : ''}
+        <section class="contactList" aria-label="Contatos">
+          ${renderContact('Bianca', 'Contato seguro', canChat && state.role === 'a', canChat ? 'Chat ativo' : 'Crie ou cole um convite')}
+          ${renderContact('Alice', 'Contato seguro', canChat && state.role === 'b', canChat ? 'Chat ativo' : 'Crie ou cole um convite')}
+          ${renderContact('Observabilidade', 'Fila do relay', false, `${state.ops?.totals.pendingMessages ?? 0} pendente(s)`)}
+        </section>
+      </aside>
 
-        <section class="conversation ${canChat ? '' : 'disabled'}">
-          <div class="conversationTop">
-            <div>
-              <span>Conversa com</span>
-              <strong>${escapeHtml(canChat ? peerName : 'aguardando convite')}</strong>
-            </div>
-            <button class="secondary" id="receive" ${canChat ? '' : 'disabled'}>Receber agora</button>
+      <section class="chatPane">
+        <header class="chatTop">
+          <div class="avatar">${escapeHtml(canChat ? peerName.charAt(0) : 'Z')}</div>
+          <div>
+            <strong>${escapeHtml(canChat ? peerName : 'Chat seguro')}</strong>
+            <span>${escapeHtml(peerSubtitle)}</span>
           </div>
+          <div class="chatTopActions">
+            <button class="ghost" id="toggleAuto">${state.autoReceive ? 'Auto ligado' : 'Auto desligado'}</button>
+            <button class="ghost" id="receive" ${canChat ? '' : 'disabled'}>Receber agora</button>
+          </div>
+        </header>
 
+        <section class="chatBody">
+          ${state.invite ? `
+            <details class="inviteDrawer">
+              <summary>Convite desta conversa</summary>
+              <textarea readonly>${escapeHtml(encodeInvite(state.invite))}</textarea>
+            </details>
+          ` : ''}
+          <div class="notice">
+            <strong>${escapeHtml(myName)}</strong>
+            <span>O servidor não recebe texto puro. Ele só guarda envelope criptografado até a entrega.</span>
+          </div>
           <div id="messages" class="messages">
-            <div class="empty">As mensagens descriptografadas vao aparecer aqui.</div>
-          </div>
-
-          <div class="composer">
-            <textarea id="messageText" ${canChat ? '' : 'disabled'}>${escapeHtml(state.messageText)}</textarea>
-            <button id="send" ${canChat ? '' : 'disabled'}>Enviar criptografado</button>
+            <div class="empty">As mensagens aparecem aqui. Envie numa janela e veja chegar na outra automaticamente.</div>
           </div>
         </section>
 
-        <section class="logPanel">
-          <h3>O que aconteceu</h3>
-          <pre>${escapeHtml(state.log.join('\n') || 'Nada ainda.')}</pre>
-        </section>
+        <footer class="composer">
+          <textarea id="messageText" placeholder="${canChat ? 'Mensagem' : 'Crie ou entre em uma conversa primeiro'}" ${canChat ? '' : 'disabled'}>${escapeHtml(state.messageText)}</textarea>
+          <button id="send" ${canChat ? '' : 'disabled'}>Enviar</button>
+        </footer>
+      </section>
 
-        <section class="opsPanel" id="observability">
+      <aside class="infoPane">
+        <section class="opsPanel">
           <div class="opsHeader">
             <div>
-              <h3>Fila do servidor</h3>
-              <p>Mostra envelopes pendentes, filas e metricas. Nao mostra ciphertext completo nem texto da conversa.</p>
+              <h2>Fila do servidor</h2>
+              <p>Somente metadados: fila, tamanho, hash e contagem.</p>
             </div>
-            <button id="refreshOps">Atualizar fila</button>
+            <button id="refreshOps">Atualizar</button>
           </div>
-          <label>Token admin da demo
+          <label>Token admin
             <input id="adminToken" value="${escapeHtml(state.adminToken)}" />
           </label>
           ${renderOps()}
         </section>
-      </main>
-    </section>
+
+        <section class="logPanel">
+          <h2>Eventos</h2>
+          <pre>${escapeHtml(state.log.join('\n') || 'Nada ainda.')}</pre>
+        </section>
+      </aside>
+    </main>
   `;
 
   bind();
   refreshLocalMessages();
+}
+
+function renderContact(name: string, kind: string, active: boolean, meta: string) {
+  return `
+    <article class="contact ${active ? 'active' : ''}">
+      <span class="avatar">${escapeHtml(name.charAt(0))}</span>
+      <div>
+        <strong>${escapeHtml(name)}</strong>
+        <small>${escapeHtml(kind)}</small>
+      </div>
+      <em>${escapeHtml(meta)}</em>
+    </article>
+  `;
 }
 
 function bind() {
@@ -258,8 +238,20 @@ function bind() {
   document.querySelector<HTMLButtonElement>('#copyInvite')?.addEventListener('click', () => run(copyInvite));
   document.querySelector<HTMLButtonElement>('#persist')?.addEventListener('click', () => run(persistStorage));
   document.querySelector<HTMLButtonElement>('#send')?.addEventListener('click', () => run(sendMessage));
-  document.querySelector<HTMLButtonElement>('#receive')?.addEventListener('click', () => run(receiveMessages));
+  document.querySelector<HTMLButtonElement>('#receive')?.addEventListener('click', () => run(() => receiveMessages({ announceEmpty: true })));
   document.querySelector<HTMLButtonElement>('#refreshOps')?.addEventListener('click', () => run(refreshOps));
+  document.querySelector<HTMLButtonElement>('#toggleAuto')?.addEventListener('click', () => {
+    state.autoReceive = !state.autoReceive;
+    state.log.unshift(state.autoReceive ? 'Recebimento automático ligado.' : 'Recebimento automático desligado.');
+    syncPolling();
+    render();
+  });
+  document.querySelector<HTMLTextAreaElement>('#messageText')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      void run(sendMessage);
+    }
+  });
 }
 
 async function createInvite() {
@@ -269,14 +261,13 @@ async function createInvite() {
     { data: Direction },
     { data: Direction },
   ];
-  const [aToB, bToA] = queues;
   const chatKey = await generateHistoryKey();
   const invite: Invite = {
     version: 1,
     relayUrl: state.relayUrl,
     chatKey: await crypto.subtle.exportKey('jwk', chatKey),
-    aToB: aToB.data,
-    bToA: bToA.data,
+    aToB: queues[0].data,
+    bToA: queues[1].data,
     createdAt: new Date().toISOString(),
   };
 
@@ -284,7 +275,8 @@ async function createInvite() {
   state.chatKey = chatKey;
   state.invite = invite;
   state.inviteText = encodeInvite(invite);
-  state.log.unshift('Pessoa A criada. Convite pronto para copiar.');
+  state.log.unshift('Convite criado. Copie e cole na segunda janela.');
+  syncPolling();
 }
 
 async function joinInvite() {
@@ -294,13 +286,14 @@ async function joinInvite() {
   state.relayUrl = invite.relayUrl;
   state.invite = invite;
   state.chatKey = await crypto.subtle.importKey('jwk', invite.chatKey, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
-  state.log.unshift('Pessoa B entrou. Agora pode enviar e receber mensagens.');
+  state.log.unshift('Você entrou na conversa. O recebimento automático está ligado.');
+  syncPolling();
 }
 
 async function setupLocalVault() {
   if (state.db && state.historyKey) return;
   if (!crypto.subtle) {
-    throw new Error('Seu navegador bloqueou a criacao de chaves neste endereco. Abra pela URL HTTPS da Zuri.');
+    throw new Error('Seu navegador bloqueou a criação de chaves neste endereço. Abra pela URL HTTPS da Zuri.');
   }
 
   const device = await generateDeviceKeyPair();
@@ -314,7 +307,7 @@ async function setupLocalVault() {
 
 async function persistStorage() {
   const persisted = await requestPersistentStorage();
-  state.log.unshift(`Storage persistente: ${persisted ? 'aceito pelo navegador' : 'nao garantido pelo navegador'}.`);
+  state.log.unshift(`Storage persistente: ${persisted ? 'aceito pelo navegador' : 'não garantido pelo navegador'}.`);
 }
 
 async function copyInvite() {
@@ -354,98 +347,79 @@ async function sendMessage() {
   });
   await saveConversationMessage(message);
   state.messageText = '';
-  state.log.unshift('Mensagem enviada criptografada. O relay recebeu apenas ciphertext.');
+  state.log.unshift('Mensagem enviada. O servidor recebeu só ciphertext.');
+  void refreshOps().catch(() => undefined);
 }
 
-async function receiveMessages() {
+async function receiveMessages(options: { announceEmpty?: boolean; silent?: boolean } = {}) {
   ensureReady();
-  const direction = receiveDirection();
-  const client = new ZuriSecureRelayClient({ relayUrl: state.invite!.relayUrl });
-  const response = (await client.pull({
-    queueId: direction.queueId,
-    receiveToken: direction.receiveToken,
-  })) as {
-    data: Array<{ id: string; ciphertext: string; nonce: string }>;
-  };
-
-  for (const item of response.data) {
-    const decrypted = await decryptEnvelope(item.ciphertext, item.nonce, state.chatKey!);
-    const message = JSON.parse(decrypted.body ?? '{}') as ChatMessage;
-    await saveConversationMessage(message);
-    await client.delivered({
-      messageId: item.id,
+  if (state.isPolling) return;
+  state.isPolling = true;
+  try {
+    const direction = receiveDirection();
+    const client = new ZuriSecureRelayClient({ relayUrl: state.invite!.relayUrl });
+    const response = (await client.pull({
       queueId: direction.queueId,
       receiveToken: direction.receiveToken,
-    });
-  }
+    })) as {
+      data: Array<{ id: string; ciphertext: string; nonce: string }>;
+    };
 
-  state.log.unshift(
-    response.data.length
-      ? `${response.data.length} mensagem(ns) recebida(s), descriptografada(s) localmente e apagada(s) do relay.`
-      : 'Nenhuma mensagem nova agora.',
-  );
+    for (const item of response.data) {
+      const decrypted = await decryptEnvelope(item.ciphertext, item.nonce, state.chatKey!);
+      const message = JSON.parse(decrypted.body ?? '{}') as ChatMessage;
+      await saveConversationMessage(message);
+      await client.delivered({
+        messageId: item.id,
+        queueId: direction.queueId,
+        receiveToken: direction.receiveToken,
+      });
+    }
+
+    state.lastPollAt = new Date().toISOString();
+    if (response.data.length) {
+      state.log.unshift(`${response.data.length} mensagem(ns) recebida(s) automaticamente e apagada(s) do relay.`);
+      await refreshOps().catch(() => undefined);
+      render();
+    } else if (options.announceEmpty && !options.silent) {
+      state.log.unshift('Nenhuma mensagem nova agora.');
+    }
+  } finally {
+    state.isPolling = false;
+  }
 }
 
 async function refreshOps() {
   const response = await fetch(`${state.relayUrl}/admin/overview`, {
-    headers: {
-      'x-admin-token': state.adminToken,
-    },
+    headers: { 'x-admin-token': state.adminToken },
   });
-  if (!response.ok) throw new Error(`Nao consegui ler a fila: ${response.status}`);
+  if (!response.ok) throw new Error(`Não consegui ler a fila: ${response.status}`);
   const payload = await response.json() as { data: RelayOverview };
   state.ops = payload.data;
-  state.log.unshift('Painel da fila atualizado.');
 }
 
 function renderOps() {
   if (!state.ops) {
-    return `
-      <div class="emptyOps">
-        Clique em Atualizar fila para enxergar o que esta pendente no relay.
-      </div>
-    `;
+    return `<div class="emptyOps">Clique em Atualizar para enxergar a fila do relay.</div>`;
   }
 
   return `
     <div class="opsTotals">
       <span><strong>${state.ops.totals.queues}</strong><small>filas</small></span>
-      <span><strong>${state.ops.totals.activeQueues}</strong><small>ativas</small></span>
       <span><strong>${state.ops.totals.pendingMessages}</strong><small>pendentes</small></span>
       <span><strong>${formatBytes(state.ops.totals.pendingBytes)}</strong><small>ciphertext</small></span>
     </div>
-
-    <div class="opsGrid">
-      <div class="opsTable">
-        <h4>Filas</h4>
-        ${state.ops.queues.length ? state.ops.queues.map((queue) => `
-          <article>
-            <div>
-              <strong>${escapeHtml(shortId(queue.queueId))}</strong>
-              <small>${escapeHtml(queue.status)} · criada ${escapeHtml(formatDate(queue.createdAt))}</small>
-            </div>
-            <span>${queue.pendingCount} msg · ${formatBytes(queue.pendingBytes)}</span>
-          </article>
-        `).join('') : '<p>Nenhuma fila criada ainda.</p>'}
-      </div>
-
-      <div class="opsTable">
-        <h4>Envelopes pendentes</h4>
-        ${state.ops.pendingMessages.length ? state.ops.pendingMessages.map((message) => `
-          <article>
-            <div>
-              <strong>${escapeHtml(shortId(message.id))}</strong>
-              <small>${escapeHtml(shortId(message.queueId))} · hash ${escapeHtml(message.ciphertextHash.slice(0, 12))}</small>
-            </div>
-            <span>${formatBytes(message.byteSize)}</span>
-          </article>
-        `).join('') : '<p>Nenhum envelope pendente. Quando entrega, some do relay.</p>'}
-      </div>
+    <div class="opsTable">
+      ${state.ops.pendingMessages.length ? state.ops.pendingMessages.map((message) => `
+        <article>
+          <div>
+            <strong>${escapeHtml(shortId(message.id))}</strong>
+            <small>${escapeHtml(shortId(message.queueId))} · hash ${escapeHtml(message.ciphertextHash.slice(0, 12))}</small>
+          </div>
+          <span>${formatBytes(message.byteSize)}</span>
+        </article>
+      `).join('') : '<p>Nenhum envelope pendente. Quando entrega, some.</p>'}
     </div>
-
-    <p class="opsFootnote">
-      Atualizado em ${escapeHtml(formatDate(state.ops.generatedAt))}. Plaintext no relay: ${state.ops.relayStoresPlaintext ? 'sim' : 'nao'}.
-    </p>
   `;
 }
 
@@ -480,33 +454,49 @@ async function refreshLocalMessages() {
       const mine = parsed.from === state.role;
       return `
         <article class="bubble ${mine ? 'mine' : 'theirs'}">
-          <span>${mine ? 'Voce' : parsed.from === 'a' ? 'Pessoa A' : 'Pessoa B'}</span>
           <p>${escapeHtml(parsed.text)}</p>
-          <small>${escapeHtml(new Date(parsed.createdAt).toLocaleString())}</small>
+          <small>${escapeHtml(new Date(parsed.createdAt).toLocaleTimeString())}</small>
         </article>
       `;
     })
     .join('');
+  element.scrollTop = element.scrollHeight;
+}
+
+function syncPolling() {
+  if (pollTimer) {
+    window.clearInterval(pollTimer);
+    pollTimer = undefined;
+  }
+  if (!state.autoReceive) return;
+
+  pollTimer = window.setInterval(() => {
+    if (document.hidden || !isReady()) return;
+    void receiveMessages({ silent: true }).catch((error) => {
+      state.log.unshift(error instanceof Error ? error.message : 'Falha ao buscar mensagens.');
+      render();
+    });
+  }, 2500);
 }
 
 function sendDirection() {
-  if (state.role === 'a') return state.invite!.aToB;
-  return state.invite!.bToA;
+  return state.role === 'a' ? state.invite!.aToB : state.invite!.bToA;
 }
 
 function receiveDirection() {
-  if (state.role === 'a') return state.invite!.bToA;
-  return state.invite!.aToB;
+  return state.role === 'a' ? state.invite!.bToA : state.invite!.aToB;
 }
 
 function conversationRef() {
   return `conversation_${state.invite!.aToB.queueId}_${state.invite!.bToA.queueId}`;
 }
 
+function isReady() {
+  return Boolean(state.role && state.invite && state.chatKey && state.historyKey && state.db);
+}
+
 function ensureReady() {
-  if (!state.role || !state.invite || !state.chatKey || !state.historyKey || !state.db) {
-    throw new Error('Crie um convite ou entre em uma conversa primeiro.');
-  }
+  if (!isReady()) throw new Error('Crie um convite ou entre em uma conversa primeiro.');
 }
 
 function encodeInvite(invite: Invite) {
@@ -521,7 +511,7 @@ function decodeInvite(value: string): Invite {
     }
     return invite;
   } catch {
-    throw new Error('Convite invalido. Copie o bloco inteiro da janela A.');
+    throw new Error('Convite inválido. Copie o bloco inteiro da outra janela.');
   }
 }
 
@@ -544,16 +534,12 @@ function escapeHtml(value: string) {
 }
 
 function shortId(value: string) {
-  if (value.length <= 22) return value;
-  return `${value.slice(0, 14)}...${value.slice(-5)}`;
+  if (value.length <= 20) return value;
+  return `${value.slice(0, 12)}...${value.slice(-5)}`;
 }
 
 function formatBytes(value: number) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
-}
-
-function formatDate(value: string) {
-  return new Date(value).toLocaleString();
 }
