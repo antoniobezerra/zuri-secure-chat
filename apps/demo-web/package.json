@@ -1,0 +1,22 @@
+{
+  "name": "@zuri-secure-chat/demo-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "dev": "vite --host 0.0.0.0 --port 5177",
+    "preview": "vite preview --host 0.0.0.0 --port 5177"
+  },
+  "dependencies": {
+    "@zuri-secure-chat/web-sdk": "workspace:*",
+    "@zuri-secure-chat/protocol": "workspace:*",
+    "vite": "7.3.0"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}
+

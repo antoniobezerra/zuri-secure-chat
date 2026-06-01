@@ -1,0 +1,7 @@
+Zuri Secure Chat is a multi-license open source project.
+
+Server-side relay, worker, Docker and infrastructure code are licensed under AGPL-3.0-only.
+Client SDK and protocol packages are licensed under MIT.
+
+Each package declares its SPDX license in its own package.json.
+

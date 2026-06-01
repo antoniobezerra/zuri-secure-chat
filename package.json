@@ -1,0 +1,20 @@
+{
+  "name": "zuri-secure-chat",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.5.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r --sort build",
+    "check": "pnpm -r --sort check",
+    "test": "pnpm run test:security-contract",
+    "test:security-contract": "pnpm build && node test/security-contract.test.mjs",
+    "dev": "pnpm --parallel --filter @zuri-secure-chat/server --filter @zuri-secure-chat/retention-worker --filter @zuri-secure-chat/demo-web dev",
+    "db:migrate": "psql \"$DATABASE_URL\" -f infra/schema.sql"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

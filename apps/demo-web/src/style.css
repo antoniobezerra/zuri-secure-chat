@@ -1,0 +1,152 @@
+:root {
+  color-scheme: dark;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #111312;
+  color: #f6f2ea;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 15% 0%, rgba(62, 180, 137, 0.22), transparent 32rem),
+    linear-gradient(140deg, #101312 0%, #171b1a 50%, #111312 100%);
+}
+
+main {
+  width: min(1120px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 48px 0;
+}
+
+.hero {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+h1,
+h2 {
+  margin: 0;
+  letter-spacing: 0;
+}
+
+h1 {
+  max-width: 780px;
+  font-size: clamp(2.25rem, 6vw, 5rem);
+  line-height: 0.95;
+}
+
+p {
+  margin: 0;
+  color: #c9c3b8;
+  line-height: 1.6;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.panel {
+  border: 1px solid rgba(246, 242, 234, 0.12);
+  border-radius: 8px;
+  background: rgba(20, 24, 23, 0.82);
+  padding: 18px;
+}
+
+.panel.full {
+  grid-column: 1 / -1;
+}
+
+label {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  color: #dcd4c6;
+  font-size: 0.92rem;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid rgba(246, 242, 234, 0.18);
+  border-radius: 8px;
+  background: #0b0d0c;
+  color: #f6f2ea;
+  padding: 12px;
+  font: inherit;
+}
+
+textarea {
+  min-height: 110px;
+  resize: vertical;
+}
+
+button {
+  border: 0;
+  border-radius: 8px;
+  background: #55c995;
+  color: #08110d;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 800;
+  padding: 12px 14px;
+}
+
+button.secondary {
+  background: #f1eadc;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+pre {
+  max-height: 340px;
+  overflow: auto;
+  border-radius: 8px;
+  background: #080a09;
+  color: #c8f7dc;
+  padding: 14px;
+  white-space: pre-wrap;
+}
+
+.messages {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.message {
+  border-radius: 8px;
+  background: rgba(85, 201, 149, 0.1);
+  padding: 12px;
+}
+
+.message small {
+  display: block;
+  color: #9d9385;
+  margin-top: 6px;
+}
+
+@media (max-width: 760px) {
+  main {
+    width: min(100vw - 20px, 1120px);
+    padding: 28px 0;
+  }
+
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}
+

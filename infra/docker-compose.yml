@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: zuri_chat
+      POSTGRES_USER: zuri_chat
+      POSTGRES_PASSWORD: zuri_chat
+    ports:
+      - "5544:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zuri_chat -d zuri_chat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6388:6379"
+    volumes:
+      - redis-data:/data
+
+  chat-relay:
+    build:
+      context: ..
+      dockerfile: apps/server/Dockerfile
+    environment:
+      CHAT_RELAY_PORT: 4088
+      DATABASE_URL: postgresql://zuri_chat:zuri_chat@postgres:5432/zuri_chat
+      METRICS_SALT: local-docker-metrics-salt
+      MESSAGE_TTL_DAYS: 30
+    ports:
+      - "4088:4088"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  retention-worker:
+    build:
+      context: ..
+      dockerfile: apps/retention-worker/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://zuri_chat:zuri_chat@postgres:5432/zuri_chat
+      METRICS_SALT: local-docker-metrics-salt
+      RETENTION_INTERVAL_MS: 60000
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  chat-demo-web:
+    build:
+      context: ..
+      dockerfile: apps/demo-web/Dockerfile
+    environment:
+      VITE_RELAY_URL: http://localhost:4088
+    ports:
+      - "5177:5177"
+    depends_on:
+      - chat-relay
+
+volumes:
+  postgres-data:
+  redis-data:
+
