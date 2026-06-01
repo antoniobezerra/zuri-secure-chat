@@ -25,8 +25,14 @@ type AppState = {
   db?: IDBDatabase;
 };
 
+function defaultRelayUrl() {
+  const configured = import.meta.env.VITE_RELAY_URL as string | undefined;
+  if (configured) return configured;
+  return `${window.location.protocol}//${window.location.hostname}:4088`;
+}
+
 const state: AppState = {
-  relayUrl: import.meta.env.VITE_RELAY_URL ?? 'http://localhost:4088',
+  relayUrl: defaultRelayUrl(),
   queueId: '',
   sendToken: '',
   receiveToken: '',
