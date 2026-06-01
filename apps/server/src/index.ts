@@ -34,6 +34,28 @@ type MessageRow = {
   expires_at: Date | string;
 };
 
+type AdminQueueRow = {
+  queue_id: string;
+  status: string;
+  created_at: Date | string;
+  pending_count: string | number;
+  pending_bytes: string | number | null;
+  oldest_pending_at: Date | string | null;
+  newest_pending_at: Date | string | null;
+  expires_next_at: Date | string | null;
+};
+
+type AdminMessageRow = {
+  id: string;
+  queue_id: string;
+  client_message_id: string | null;
+  envelope_version: number;
+  ciphertext: string;
+  byte_size: number;
+  created_at: Date | string;
+  expires_at: Date | string;
+};
+
 type MetricRow = {
   bucket_at: Date | string;
   metric_hash: string;
@@ -45,6 +67,7 @@ type MetricRow = {
 const db = new Database();
 const app = Fastify({ logger: true });
 const ttlDays = Number(process.env.MESSAGE_TTL_DAYS ?? 30);
+const adminToken = process.env.ADMIN_TOKEN;
 
 await app.register(cors, {
   origin: true,
@@ -223,6 +246,71 @@ app.get('/metrics/hourly', async () => {
   };
 });
 
+app.get('/admin/overview', async (request, reply) => {
+  if (!authorizeAdmin(request.headers['x-admin-token'])) {
+    return reply.code(401).send({ error: 'Invalid admin token.' });
+  }
+
+  const queueResult = await db.query<AdminQueueRow>(
+    `SELECT
+       q.id AS queue_id,
+       q.status,
+       q.created_at,
+       count(m.id) AS pending_count,
+       coalesce(sum(m.byte_size), 0) AS pending_bytes,
+       min(m.created_at) AS oldest_pending_at,
+       max(m.created_at) AS newest_pending_at,
+       min(m.expires_at) AS expires_next_at
+     FROM queues q
+     LEFT JOIN queued_messages m ON m.queue_id = q.id AND m.expires_at > now()
+     GROUP BY q.id, q.status, q.created_at
+     ORDER BY pending_count DESC, q.created_at DESC
+     LIMIT 200`,
+  );
+  const recentResult = await db.query<AdminMessageRow>(
+    `SELECT id, queue_id, client_message_id, envelope_version, ciphertext, byte_size, created_at, expires_at
+     FROM queued_messages
+     WHERE expires_at > now()
+     ORDER BY created_at DESC
+     LIMIT 80`,
+  );
+  const metricResult = await db.query<MetricRow>(
+    `SELECT bucket_at, metric_hash, enqueued_count, delivered_count, expired_count
+     FROM hourly_metrics
+     ORDER BY bucket_at DESC
+     LIMIT 48`,
+  );
+
+  const queues = queueResult.rows.map(mapAdminQueue);
+  const pendingMessages = recentResult.rows.map(mapAdminMessage);
+  const totals = queues.reduce(
+    (acc, queue) => ({
+      queues: acc.queues + 1,
+      activeQueues: acc.activeQueues + (queue.status === 'active' ? 1 : 0),
+      pendingMessages: acc.pendingMessages + queue.pendingCount,
+      pendingBytes: acc.pendingBytes + queue.pendingBytes,
+    }),
+    { queues: 0, activeQueues: 0, pendingMessages: 0, pendingBytes: 0 },
+  );
+
+  return {
+    data: {
+      generatedAt: new Date().toISOString(),
+      relayStoresPlaintext: false,
+      totals,
+      queues,
+      pendingMessages,
+      hourlyMetrics: metricResult.rows.map((row) => ({
+        bucketAt: iso(row.bucket_at),
+        metricHash: row.metric_hash,
+        enqueuedCount: row.enqueued_count,
+        deliveredCount: row.delivered_count,
+        expiredCount: row.expired_count,
+      })),
+    },
+  };
+});
+
 process.once('SIGTERM', async () => {
   await db.close();
   process.exit(0);
@@ -269,8 +357,44 @@ function mapMessage(row: MessageRow | undefined): QueuedMessage | undefined {
   };
 }
 
+function mapAdminQueue(row: AdminQueueRow) {
+  return {
+    queueId: row.queue_id,
+    status: row.status,
+    createdAt: iso(row.created_at),
+    pendingCount: Number(row.pending_count),
+    pendingBytes: Number(row.pending_bytes ?? 0),
+    oldestPendingAt: isoOrNull(row.oldest_pending_at),
+    newestPendingAt: isoOrNull(row.newest_pending_at),
+    expiresNextAt: isoOrNull(row.expires_next_at),
+  };
+}
+
+function mapAdminMessage(row: AdminMessageRow) {
+  return {
+    id: row.id,
+    queueId: row.queue_id,
+    clientMessageId: row.client_message_id ?? undefined,
+    envelopeVersion: row.envelope_version,
+    ciphertextHash: ciphertextHash(row.ciphertext),
+    byteSize: row.byte_size,
+    createdAt: iso(row.created_at),
+    expiresAt: iso(row.expires_at),
+  };
+}
+
+function authorizeAdmin(input: string | string[] | undefined) {
+  if (!adminToken) return process.env.NODE_ENV !== 'production';
+  const token = Array.isArray(input) ? input[0] : input;
+  return token === adminToken;
+}
+
 function iso(value: Date | string | undefined) {
   if (!value) return new Date().toISOString();
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 }
 
+function isoOrNull(value: Date | string | null | undefined) {
+  if (!value) return null;
+  return iso(value);
+}

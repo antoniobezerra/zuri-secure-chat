@@ -31,6 +31,7 @@ services:
       DATABASE_URL: postgresql://zuri_chat:zuri_chat@postgres:5432/zuri_chat
       METRICS_SALT: local-docker-metrics-salt
       MESSAGE_TTL_DAYS: 30
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-zuri-demo-admin}
     ports:
       - "4088:4088"
     depends_on:

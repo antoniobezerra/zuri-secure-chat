@@ -183,7 +183,8 @@ small {
 .setupBox,
 .inviteBox,
 .conversation,
-.logPanel {
+.logPanel,
+.opsPanel {
   background: rgba(17, 20, 19, 0.88);
   border: 1px solid rgba(248, 243, 233, 0.12);
   border-radius: 8px;
@@ -380,6 +381,102 @@ textarea {
   padding: 16px;
 }
 
+.opsPanel {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+}
+
+.opsHeader {
+  align-items: start;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.opsHeader div {
+  display: grid;
+  gap: 6px;
+}
+
+.opsHeader p,
+.opsFootnote,
+.emptyOps {
+  color: #cfc5b6;
+}
+
+.emptyOps {
+  background: #080a09;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.opsTotals {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.opsTotals span {
+  background: rgba(88, 214, 155, 0.1);
+  border: 1px solid rgba(88, 214, 155, 0.18);
+  border-radius: 8px;
+  display: grid;
+  gap: 2px;
+  padding: 12px;
+}
+
+.opsTotals strong {
+  color: #58d69b;
+  font-size: 1.35rem;
+}
+
+.opsTotals small,
+.opsTable small {
+  color: #9f9588;
+}
+
+.opsGrid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.opsTable {
+  background: #080a09;
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  max-height: 360px;
+  overflow: auto;
+  padding: 12px;
+}
+
+.opsTable article {
+  align-items: center;
+  background: rgba(248, 243, 233, 0.06);
+  border-radius: 8px;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding: 10px;
+}
+
+.opsTable article div {
+  display: grid;
+  gap: 2px;
+}
+
+.opsTable article span {
+  color: #58d69b;
+  font-weight: 800;
+  text-align: right;
+}
+
+.opsFootnote {
+  font-size: 0.9rem;
+}
+
 pre {
   background: #080a09;
   border-radius: 8px;
@@ -399,7 +496,9 @@ pre {
 
   .statusBar,
   .workspace,
-  .setupGrid {
+  .setupGrid,
+  .opsGrid,
+  .opsTotals {
     grid-template-columns: 1fr;
   }
 
@@ -410,6 +509,11 @@ pre {
   .chatHeader,
   .conversationTop,
   .composer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .opsHeader {
     align-items: stretch;
     flex-direction: column;
   }

@@ -36,12 +36,52 @@ type ChatMessage = {
   createdAt: string;
 };
 
+type RelayOverview = {
+  generatedAt: string;
+  relayStoresPlaintext: boolean;
+  totals: {
+    queues: number;
+    activeQueues: number;
+    pendingMessages: number;
+    pendingBytes: number;
+  };
+  queues: Array<{
+    queueId: string;
+    status: string;
+    createdAt: string;
+    pendingCount: number;
+    pendingBytes: number;
+    oldestPendingAt: string | null;
+    newestPendingAt: string | null;
+    expiresNextAt: string | null;
+  }>;
+  pendingMessages: Array<{
+    id: string;
+    queueId: string;
+    clientMessageId?: string;
+    envelopeVersion: number;
+    ciphertextHash: string;
+    byteSize: number;
+    createdAt: string;
+    expiresAt: string;
+  }>;
+  hourlyMetrics: Array<{
+    bucketAt: string;
+    metricHash: string;
+    enqueuedCount: number;
+    deliveredCount: number;
+    expiredCount: number;
+  }>;
+};
+
 type AppState = {
   relayUrl: string;
+  adminToken: string;
   role: Role | null;
   inviteText: string;
   messageText: string;
   log: string[];
+  ops?: RelayOverview;
   backup?: VaultBackup;
   historyKey?: CryptoKey;
   chatKey?: CryptoKey;
@@ -57,6 +97,7 @@ function defaultRelayUrl() {
 
 const state: AppState = {
   relayUrl: defaultRelayUrl(),
+  adminToken: 'zuri-demo-admin',
   role: null,
   inviteText: '',
   messageText: 'Oi, testando o Chat Zuri Seguro.',
@@ -77,6 +118,7 @@ function render() {
       <p>Abra esta pagina em dois navegadores. No primeiro, crie o convite. No segundo, cole o convite. Depois envie e receba mensagens sem o relay ver texto puro.</p>
       <div class="heroLinks">
         <a href="#start">Comecar</a>
+        <a href="#observability">Ver fila</a>
         <a href="${escapeHtml(state.relayUrl)}/health" target="_blank" rel="noreferrer">Ver relay</a>
       </div>
     </section>
@@ -175,6 +217,20 @@ function render() {
           <h3>O que aconteceu</h3>
           <pre>${escapeHtml(state.log.join('\n') || 'Nada ainda.')}</pre>
         </section>
+
+        <section class="opsPanel" id="observability">
+          <div class="opsHeader">
+            <div>
+              <h3>Fila do servidor</h3>
+              <p>Mostra envelopes pendentes, filas e metricas. Nao mostra ciphertext completo nem texto da conversa.</p>
+            </div>
+            <button id="refreshOps">Atualizar fila</button>
+          </div>
+          <label>Token admin da demo
+            <input id="adminToken" value="${escapeHtml(state.adminToken)}" />
+          </label>
+          ${renderOps()}
+        </section>
       </main>
     </section>
   `;
@@ -186,6 +242,9 @@ function render() {
 function bind() {
   document.querySelector<HTMLInputElement>('#relayUrl')?.addEventListener('input', (event) => {
     state.relayUrl = (event.target as HTMLInputElement).value;
+  });
+  document.querySelector<HTMLInputElement>('#adminToken')?.addEventListener('input', (event) => {
+    state.adminToken = (event.target as HTMLInputElement).value;
   });
   document.querySelector<HTMLTextAreaElement>('#inviteInput')?.addEventListener('input', (event) => {
     state.inviteText = (event.target as HTMLTextAreaElement).value;
@@ -199,6 +258,7 @@ function bind() {
   document.querySelector<HTMLButtonElement>('#persist')?.addEventListener('click', () => run(persistStorage));
   document.querySelector<HTMLButtonElement>('#send')?.addEventListener('click', () => run(sendMessage));
   document.querySelector<HTMLButtonElement>('#receive')?.addEventListener('click', () => run(receiveMessages));
+  document.querySelector<HTMLButtonElement>('#refreshOps')?.addEventListener('click', () => run(refreshOps));
 }
 
 async function createInvite() {
@@ -322,6 +382,69 @@ async function receiveMessages() {
   );
 }
 
+async function refreshOps() {
+  const response = await fetch(`${state.relayUrl}/admin/overview`, {
+    headers: {
+      'x-admin-token': state.adminToken,
+    },
+  });
+  if (!response.ok) throw new Error(`Nao consegui ler a fila: ${response.status}`);
+  const payload = await response.json() as { data: RelayOverview };
+  state.ops = payload.data;
+  state.log.unshift('Painel da fila atualizado.');
+}
+
+function renderOps() {
+  if (!state.ops) {
+    return `
+      <div class="emptyOps">
+        Clique em Atualizar fila para enxergar o que esta pendente no relay.
+      </div>
+    `;
+  }
+
+  return `
+    <div class="opsTotals">
+      <span><strong>${state.ops.totals.queues}</strong><small>filas</small></span>
+      <span><strong>${state.ops.totals.activeQueues}</strong><small>ativas</small></span>
+      <span><strong>${state.ops.totals.pendingMessages}</strong><small>pendentes</small></span>
+      <span><strong>${formatBytes(state.ops.totals.pendingBytes)}</strong><small>ciphertext</small></span>
+    </div>
+
+    <div class="opsGrid">
+      <div class="opsTable">
+        <h4>Filas</h4>
+        ${state.ops.queues.length ? state.ops.queues.map((queue) => `
+          <article>
+            <div>
+              <strong>${escapeHtml(shortId(queue.queueId))}</strong>
+              <small>${escapeHtml(queue.status)} · criada ${escapeHtml(formatDate(queue.createdAt))}</small>
+            </div>
+            <span>${queue.pendingCount} msg · ${formatBytes(queue.pendingBytes)}</span>
+          </article>
+        `).join('') : '<p>Nenhuma fila criada ainda.</p>'}
+      </div>
+
+      <div class="opsTable">
+        <h4>Envelopes pendentes</h4>
+        ${state.ops.pendingMessages.length ? state.ops.pendingMessages.map((message) => `
+          <article>
+            <div>
+              <strong>${escapeHtml(shortId(message.id))}</strong>
+              <small>${escapeHtml(shortId(message.queueId))} · hash ${escapeHtml(message.ciphertextHash.slice(0, 12))}</small>
+            </div>
+            <span>${formatBytes(message.byteSize)}</span>
+          </article>
+        `).join('') : '<p>Nenhum envelope pendente. Quando entrega, some do relay.</p>'}
+      </div>
+    </div>
+
+    <p class="opsFootnote">
+      Atualizado em ${escapeHtml(formatDate(state.ops.generatedAt))}. Plaintext no relay: ${state.ops.relayStoresPlaintext ? 'sim' : 'nao'}.
+    </p>
+  `;
+}
+
 async function saveConversationMessage(message: ChatMessage) {
   await saveLocalMessage({
     db: state.db!,
@@ -414,4 +537,19 @@ function escapeHtml(value: string) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+function shortId(value: string) {
+  if (value.length <= 22) return value;
+  return `${value.slice(0, 14)}...${value.slice(-5)}`;
+}
+
+function formatBytes(value: number) {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatDate(value: string) {
+  return new Date(value).toLocaleString();
 }
