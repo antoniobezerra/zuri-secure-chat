@@ -8,9 +8,11 @@ import {
   openLocalHistoryDb,
   requestPersistentStorage,
   saveLocalMessage,
+  ZuriSecureRealtimeClient,
   ZuriSecureRelayClient,
   type VaultBackup,
 } from '@zuri-secure-chat/web-sdk';
+import type { QueuedMessage, WsServerEvent } from '@zuri-secure-chat/protocol';
 import './style.css';
 
 type Direction = {
@@ -34,6 +36,7 @@ type ChatMessage = {
   from: Role;
   text: string;
   createdAt: string;
+  clientMessageId?: string;
 };
 
 type RelayOverview = {
@@ -71,6 +74,7 @@ type AppState = {
   log: string[];
   autoReceive: boolean;
   isPolling: boolean;
+  realtimeStatus: 'offline' | 'connecting' | 'online';
   lastPollAt?: string;
   ops?: RelayOverview;
   backup?: VaultBackup;
@@ -81,6 +85,8 @@ type AppState = {
 };
 
 let pollTimer: number | undefined;
+let realtimeClient: ZuriSecureRealtimeClient | undefined;
+const sentStatuses = new Map<string, 'sending' | 'stored' | 'delivered'>();
 
 function defaultRelayUrl() {
   const configured = import.meta.env.VITE_RELAY_URL as string | undefined;
@@ -98,17 +104,18 @@ const state: AppState = {
   log: [],
   autoReceive: true,
   isPolling: false,
+  realtimeStatus: 'offline',
 };
 
 render();
-syncPolling();
+syncRealtime();
 
 function render() {
   const canChat = isReady();
   const myName = state.role === 'a' ? 'Você: Alice' : state.role === 'b' ? 'Você: Bianca' : 'Sem sessão';
   const peerName = state.role === 'a' ? 'Bianca' : 'Alice';
   const peerSubtitle = canChat
-    ? state.autoReceive ? 'online · recebimento automático' : 'online · recebimento manual'
+    ? state.autoReceive ? `${realtimeLabel()} · WebSocket` : 'online · recebimento manual'
     : 'aguardando convite seguro';
 
   document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
@@ -153,7 +160,7 @@ function render() {
             <span>${escapeHtml(peerSubtitle)}</span>
           </div>
           <div class="chatTopActions">
-            <button class="ghost" id="toggleAuto">${state.autoReceive ? 'Auto ligado' : 'Auto desligado'}</button>
+            <button class="ghost" id="toggleAuto">${state.autoReceive ? 'WS ligado' : 'WS desligado'}</button>
             <button class="ghost" id="receive" ${canChat ? '' : 'disabled'}>Receber agora</button>
           </div>
         </header>
@@ -242,8 +249,8 @@ function bind() {
   document.querySelector<HTMLButtonElement>('#refreshOps')?.addEventListener('click', () => run(refreshOps));
   document.querySelector<HTMLButtonElement>('#toggleAuto')?.addEventListener('click', () => {
     state.autoReceive = !state.autoReceive;
-    state.log.unshift(state.autoReceive ? 'Recebimento automático ligado.' : 'Recebimento automático desligado.');
-    syncPolling();
+    state.log.unshift(state.autoReceive ? 'WebSocket ligado.' : 'WebSocket desligado.');
+    syncRealtime();
     render();
   });
   document.querySelector<HTMLTextAreaElement>('#messageText')?.addEventListener('keydown', (event) => {
@@ -276,7 +283,7 @@ async function createInvite() {
   state.invite = invite;
   state.inviteText = encodeInvite(invite);
   state.log.unshift('Convite criado. Copie e cole na segunda janela.');
-  syncPolling();
+  syncRealtime();
 }
 
 async function joinInvite() {
@@ -286,8 +293,8 @@ async function joinInvite() {
   state.relayUrl = invite.relayUrl;
   state.invite = invite;
   state.chatKey = await crypto.subtle.importKey('jwk', invite.chatKey, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
-  state.log.unshift('Você entrou na conversa. O recebimento automático está ligado.');
-  syncPolling();
+  state.log.unshift('Você entrou na conversa. O WebSocket está ligado.');
+  syncRealtime();
 }
 
 async function setupLocalVault() {
@@ -323,10 +330,12 @@ async function sendMessage() {
 
   const direction = sendDirection();
   const client = new ZuriSecureRelayClient({ relayUrl: state.invite!.relayUrl });
+  const clientMessageId = crypto.randomUUID();
   const message: ChatMessage = {
     from: state.role!,
     text,
     createdAt: new Date().toISOString(),
+    clientMessageId,
   };
   const envelope = await encryptEnvelope(
     {
@@ -338,16 +347,30 @@ async function sendMessage() {
     state.chatKey!,
   );
 
-  await client.enqueue({
-    queueId: direction.queueId,
-    sendToken: direction.sendToken,
-    ciphertext: envelope.ciphertext,
-    nonce: envelope.nonce,
-    clientMessageId: crypto.randomUUID(),
-  });
+  sentStatuses.set(clientMessageId, 'sending');
   await saveConversationMessage(message);
+  if (realtimeClient && state.realtimeStatus === 'online') {
+    realtimeClient.send({
+      type: 'message.send',
+      queueId: direction.queueId,
+      sendToken: direction.sendToken,
+      ciphertext: envelope.ciphertext,
+      nonce: envelope.nonce,
+      envelopeVersion: 1,
+      clientMessageId,
+    });
+  } else {
+    await client.enqueue({
+      queueId: direction.queueId,
+      sendToken: direction.sendToken,
+      ciphertext: envelope.ciphertext,
+      nonce: envelope.nonce,
+      clientMessageId,
+    });
+    sentStatuses.set(clientMessageId, 'stored');
+  }
   state.messageText = '';
-  state.log.unshift('Mensagem enviada. O servidor recebeu só ciphertext.');
+  state.log.unshift('Mensagem enviada criptografada. Aguardando recibo do relay.');
   void refreshOps().catch(() => undefined);
 }
 
@@ -366,9 +389,7 @@ async function receiveMessages(options: { announceEmpty?: boolean; silent?: bool
     };
 
     for (const item of response.data) {
-      const decrypted = await decryptEnvelope(item.ciphertext, item.nonce, state.chatKey!);
-      const message = JSON.parse(decrypted.body ?? '{}') as ChatMessage;
-      await saveConversationMessage(message);
+      await storeReceivedMessage(item);
       await client.delivered({
         messageId: item.id,
         queueId: direction.queueId,
@@ -387,6 +408,13 @@ async function receiveMessages(options: { announceEmpty?: boolean; silent?: bool
   } finally {
     state.isPolling = false;
   }
+}
+
+async function storeReceivedMessage(item: Pick<QueuedMessage, 'ciphertext' | 'nonce'>) {
+  if (!item.nonce) throw new Error('Envelope sem nonce.');
+  const decrypted = await decryptEnvelope(item.ciphertext, item.nonce, state.chatKey!);
+  const message = JSON.parse(decrypted.body ?? '{}') as ChatMessage;
+  await saveConversationMessage(message);
 }
 
 async function refreshOps() {
@@ -452,10 +480,11 @@ async function refreshLocalMessages() {
     .map(({ message }) => {
       const parsed = JSON.parse(message.body ?? '{}') as ChatMessage;
       const mine = parsed.from === state.role;
+      const status = mine && parsed.clientMessageId ? sentStatuses.get(parsed.clientMessageId) ?? 'stored' : undefined;
       return `
         <article class="bubble ${mine ? 'mine' : 'theirs'}">
           <p>${escapeHtml(parsed.text)}</p>
-          <small>${escapeHtml(new Date(parsed.createdAt).toLocaleTimeString())}</small>
+          <small>${escapeHtml(new Date(parsed.createdAt).toLocaleTimeString())}${status ? ` · ${renderReceipt(status)}` : ''}</small>
         </article>
       `;
     })
@@ -479,12 +508,103 @@ function syncPolling() {
   }, 2500);
 }
 
+function syncRealtime() {
+  realtimeClient?.close();
+  realtimeClient = undefined;
+
+  if (!state.autoReceive || !isReady()) {
+    state.realtimeStatus = 'offline';
+    return;
+  }
+
+  const direction = receiveDirection();
+  realtimeClient = new ZuriSecureRealtimeClient({
+    relayUrl: state.invite!.relayUrl,
+    queueId: direction.queueId,
+    receiveToken: direction.receiveToken,
+    onStatus: (status) => {
+      state.realtimeStatus = status === 'open' ? 'online' : status === 'connecting' ? 'connecting' : 'offline';
+      render();
+    },
+    onError: (error) => {
+      state.log.unshift(error.message);
+      render();
+    },
+    onEvent: (event) => {
+      void handleRealtimeEvent(event).catch((error) => {
+        state.log.unshift(error instanceof Error ? error.message : 'Falha no WebSocket.');
+        render();
+      });
+    },
+  });
+  realtimeClient.connect();
+}
+
+async function handleRealtimeEvent(event: WsServerEvent) {
+  if (event.type === 'ready') {
+    state.log.unshift(`WebSocket pronto. ${event.pending} envelope(s) pendente(s).`);
+    return;
+  }
+
+  if (event.type === 'message.stored') {
+    sentStatuses.set(event.clientMessageId, 'stored');
+    state.log.unshift(`✓ enviada: ${shortId(event.clientMessageId)}`);
+    void refreshOps().catch(() => undefined);
+    render();
+    return;
+  }
+
+  if (event.type === 'message.delivered') {
+    if (event.clientMessageId) sentStatuses.set(event.clientMessageId, 'delivered');
+    state.log.unshift(`✓✓ entregue: ${shortId(event.clientMessageId ?? event.messageId)}`);
+    void refreshOps().catch(() => undefined);
+    render();
+    return;
+  }
+
+  if (event.type === 'message.deliver') {
+    await storeReceivedMessage(event.message);
+    realtimeClient?.send({
+      type: 'message.received',
+      messageId: event.message.id,
+      queueId: event.message.queueId,
+      receiveToken: receiveDirection().receiveToken,
+    });
+    state.log.unshift('Nova mensagem recebida via WebSocket e confirmada para apagar.');
+    await refreshOps().catch(() => undefined);
+    render();
+    return;
+  }
+
+  if (event.type === 'message.deleted') {
+    state.log.unshift(`Relay apagou envelope ${shortId(event.messageId)}.`);
+    return;
+  }
+
+  if (event.type === 'error') {
+    state.log.unshift(event.message);
+    render();
+  }
+}
+
 function sendDirection() {
   return state.role === 'a' ? state.invite!.aToB : state.invite!.bToA;
 }
 
 function receiveDirection() {
   return state.role === 'a' ? state.invite!.bToA : state.invite!.aToB;
+}
+
+function realtimeLabel() {
+  if (state.realtimeStatus === 'online') return 'online';
+  if (state.realtimeStatus === 'connecting') return 'conectando';
+  return 'offline';
+}
+
+function renderReceipt(status: 'sending' | 'stored' | 'delivered') {
+  if (status === 'delivered') return '✓✓';
+  if (status === 'stored') return '✓';
+  return '...';
 }
 
 function conversationRef() {

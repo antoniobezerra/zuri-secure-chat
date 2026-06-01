@@ -61,6 +61,73 @@ export const deliveredMessageInputSchema = z.object({
   receiveToken: capabilityTokenSchema,
 }).strict();
 
+export const wsOpenInputSchema = z.object({
+  queueId: idSchema,
+  receiveToken: capabilityTokenSchema,
+}).strict();
+
+export const wsClientEventSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('message.send'),
+    queueId: idSchema,
+    sendToken: capabilityTokenSchema,
+    clientMessageId: z.string().min(1).max(160),
+    envelopeVersion: z.number().int().positive().default(1),
+    ciphertext: ciphertextSchema,
+    nonce: nonceSchema,
+  }).strict(),
+  z.object({
+    type: z.literal('message.received'),
+    messageId: idSchema,
+    queueId: idSchema,
+    receiveToken: capabilityTokenSchema,
+  }).strict(),
+  z.object({
+    type: z.literal('ping'),
+    at: z.string().optional(),
+  }).strict(),
+]);
+
+export const wsServerEventSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('ready'),
+    queueId: idSchema,
+    pending: z.number().int().nonnegative(),
+  }).strict(),
+  z.object({
+    type: z.literal('message.stored'),
+    clientMessageId: z.string().min(1).max(160),
+    messageId: idSchema,
+    queueId: idSchema,
+    createdAt: z.string(),
+  }).strict(),
+  z.object({
+    type: z.literal('message.deliver'),
+    message: queuedMessageSchema,
+  }).strict(),
+  z.object({
+    type: z.literal('message.deleted'),
+    messageId: idSchema,
+    queueId: idSchema,
+    deliveredAt: z.string(),
+  }).strict(),
+  z.object({
+    type: z.literal('message.delivered'),
+    clientMessageId: z.string().min(1).max(160).optional(),
+    messageId: idSchema,
+    queueId: idSchema,
+    deliveredAt: z.string(),
+  }).strict(),
+  z.object({
+    type: z.literal('pong'),
+    at: z.string(),
+  }).strict(),
+  z.object({
+    type: z.literal('error'),
+    message: z.string().min(1).max(240),
+  }).strict(),
+]);
+
 export const reportReasonSchema = z.enum([
   'minor_safety',
   'non_consensual',
@@ -124,6 +191,9 @@ export type EnqueueMessageInput = z.infer<typeof enqueueMessageInputSchema>;
 export type QueuedMessage = z.infer<typeof queuedMessageSchema>;
 export type PullMessagesQuery = z.infer<typeof pullMessagesQuerySchema>;
 export type DeliveredMessageInput = z.infer<typeof deliveredMessageInputSchema>;
+export type WsOpenInput = z.infer<typeof wsOpenInputSchema>;
+export type WsClientEvent = z.infer<typeof wsClientEventSchema>;
+export type WsServerEvent = z.infer<typeof wsServerEventSchema>;
 export type CreateReportInput = z.infer<typeof createReportInputSchema>;
 export type Report = z.infer<typeof reportSchema>;
 export type HourlyMetric = z.infer<typeof hourlyMetricSchema>;

@@ -3,7 +3,11 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { assertNoPlaintextFields, enqueueMessageInputSchema } from '../packages/protocol/dist/index.js';
+import {
+  assertNoPlaintextFields,
+  enqueueMessageInputSchema,
+  wsClientEventSchema,
+} from '../packages/protocol/dist/index.js';
 
 const rootDir = dirname(fileURLToPath(new URL('../package.json', import.meta.url)));
 const validEnvelope = {
@@ -21,6 +25,20 @@ test('relay enqueue contract accepts only opaque encrypted payloads', () => {
   for (const forbidden of ['text', 'plaintext', 'body', 'message', 'uid1', 'uid2', 'memberUid', 'advertiserUid', 'phone']) {
     assert.throws(() => assertNoPlaintextFields({ ...validEnvelope, [forbidden]: 'leak' }), /forbidden relay field/);
     assert.equal(enqueueMessageInputSchema.safeParse({ ...validEnvelope, [forbidden]: 'leak' }).success, false);
+  }
+});
+
+test('websocket send contract accepts only opaque encrypted payloads', () => {
+  const validWsEnvelope = {
+    type: 'message.send',
+    ...validEnvelope,
+  };
+
+  assert.equal(wsClientEventSchema.safeParse(validWsEnvelope).success, true);
+
+  for (const forbidden of ['text', 'plaintext', 'body', 'message', 'uid1', 'uid2', 'memberUid', 'advertiserUid', 'phone']) {
+    assert.throws(() => assertNoPlaintextFields({ ...validWsEnvelope, [forbidden]: 'leak' }), /forbidden relay field/);
+    assert.equal(wsClientEventSchema.safeParse({ ...validWsEnvelope, [forbidden]: 'leak' }).success, false);
   }
 });
 

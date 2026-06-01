@@ -1,4 +1,10 @@
-import { type LocalPlaintextMessage, localPlaintextMessageSchema } from '@zuri-secure-chat/protocol';
+import {
+  type LocalPlaintextMessage,
+  type WsClientEvent,
+  type WsServerEvent,
+  localPlaintextMessageSchema,
+  wsServerEventSchema,
+} from '@zuri-secure-chat/protocol';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -87,6 +93,56 @@ export class ZuriSecureRelayClient {
       throw new Error(`Relay request failed: ${response.status}`);
     }
     return response.json() as Promise<unknown>;
+  }
+}
+
+export type RealtimeClientOptions = {
+  relayUrl: string;
+  queueId: string;
+  receiveToken: string;
+  onEvent: (event: WsServerEvent) => void;
+  onStatus?: (status: 'connecting' | 'open' | 'closed') => void;
+  onError?: (error: Error) => void;
+};
+
+export class ZuriSecureRealtimeClient {
+  private readonly options: RealtimeClientOptions;
+  private socket?: WebSocket;
+
+  constructor(options: RealtimeClientOptions) {
+    this.options = options;
+  }
+
+  connect() {
+    this.close();
+    this.options.onStatus?.('connecting');
+    const url = websocketUrl(this.options.relayUrl, this.options.queueId, this.options.receiveToken);
+    const socket = new WebSocket(url);
+    this.socket = socket;
+
+    socket.addEventListener('open', () => this.options.onStatus?.('open'));
+    socket.addEventListener('close', () => this.options.onStatus?.('closed'));
+    socket.addEventListener('error', () => this.options.onError?.(new Error('WebSocket connection failed.')));
+    socket.addEventListener('message', (event) => {
+      try {
+        const payload = JSON.parse(String(event.data));
+        this.options.onEvent(wsServerEventSchema.parse(payload));
+      } catch (error) {
+        this.options.onError?.(error instanceof Error ? error : new Error('Invalid WebSocket event.'));
+      }
+    });
+  }
+
+  send(event: WsClientEvent) {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket is not connected.');
+    }
+    this.socket.send(JSON.stringify(event));
+  }
+
+  close() {
+    this.socket?.close();
+    this.socket = undefined;
   }
 }
 
@@ -410,6 +466,15 @@ function getRecords(db: IDBDatabase, conversationRef: string) {
     request.onsuccess = () => resolve(request.result as LocalEncryptedMessage[]);
     request.onerror = () => reject(request.error);
   });
+}
+
+function websocketUrl(relayUrl: string, queueId: string, receiveToken: string) {
+  const url = new URL(relayUrl.replace(/\/$/, ''));
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.pathname = `${url.pathname.replace(/\/$/, '')}/ws`;
+  url.searchParams.set('queueId', queueId);
+  url.searchParams.set('receiveToken', receiveToken);
+  return url.toString();
 }
 
 function encodeBase64Url(bytes: Uint8Array) {

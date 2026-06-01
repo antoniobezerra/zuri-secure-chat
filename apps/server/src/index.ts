@@ -1,4 +1,5 @@
 import cors from '@fastify/cors';
+import websocket from '@fastify/websocket';
 import {
   assertNoPlaintextFields,
   createReportInputSchema,
@@ -7,9 +8,13 @@ import {
   pullMessagesQuerySchema,
   RELAY_PRODUCT,
   type QueuedMessage,
+  type WsServerEvent,
+  wsClientEventSchema,
+  wsOpenInputSchema,
 } from '@zuri-secure-chat/protocol';
 import Fastify from 'fastify';
 import { z } from 'zod';
+import type { RawData, WebSocket } from 'ws';
 import { Database } from './db.js';
 import { incrementMetric } from './metrics.js';
 import { bucketHour, capabilityToken, ciphertextHash, relayId, tokenHash } from './security.js';
@@ -68,7 +73,14 @@ const db = new Database();
 const app = Fastify({ logger: true });
 const ttlDays = Number(process.env.MESSAGE_TTL_DAYS ?? 30);
 const adminToken = process.env.ADMIN_TOKEN;
+const subscribers = new Map<string, Set<WebSocket>>();
+const deliveryWatchers = new Map<string, Set<WebSocket>>();
 
+await app.register(websocket, {
+  options: {
+    maxPayload: 512 * 1024,
+  },
+});
 await app.register(cors, {
   origin: true,
 });
@@ -106,38 +118,12 @@ app.post('/messages/enqueue', async (request, reply) => {
   const raw = request.body as Record<string, unknown>;
   assertNoPlaintextFields(raw);
   const input = enqueueMessageInputSchema.parse(raw);
-  const queue = await getQueueBySendToken(input.queueId, input.sendToken);
-
-  if (!queue) {
-    return reply.code(403).send({ error: 'Invalid queue capability.' });
-  }
-
-  const id = relayId('message');
-  const expiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000);
-  const bucketAt = bucketHour();
-  const byteSize = Buffer.byteLength(input.ciphertext, 'utf8');
-  const result = await db.query<MessageRow>(
-    `INSERT INTO queued_messages (
-       id, queue_id, client_message_id, envelope_version, ciphertext, nonce, byte_size, expires_at
-     )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     RETURNING id, queue_id, client_message_id, envelope_version, ciphertext, nonce, byte_size, created_at, expires_at`,
-    [
-      id,
-      input.queueId,
-      input.clientMessageId ?? null,
-      input.envelopeVersion,
-      input.ciphertext,
-      input.nonce ?? null,
-      byteSize,
-      expiresAt.toISOString(),
-    ],
-  );
-
-  await incrementMetric(db, input.queueId, bucketAt, 'enqueued_count');
+  const message = await enqueueMessage(input);
+  if (!message) return reply.code(403).send({ error: 'Invalid queue capability.' });
+  notifyQueue(message.queueId, message);
 
   return {
-    data: mapMessage(result.rows[0]),
+    data: message,
     integrity: {
       ciphertextHash: ciphertextHash(input.ciphertext),
     },
@@ -146,23 +132,11 @@ app.post('/messages/enqueue', async (request, reply) => {
 
 app.get('/messages/pull', async (request, reply) => {
   const query = pullMessagesQuerySchema.parse(request.query);
-  const queue = await getQueueByReceiveToken(query.queueId, query.receiveToken);
-
-  if (!queue) {
-    return reply.code(403).send({ error: 'Invalid queue capability.' });
-  }
-
-  const result = await db.query<MessageRow>(
-    `SELECT id, queue_id, client_message_id, envelope_version, ciphertext, nonce, byte_size, created_at, expires_at
-     FROM queued_messages
-     WHERE queue_id = $1 AND expires_at > now()
-     ORDER BY created_at ASC
-     LIMIT $2`,
-    [query.queueId, query.limit],
-  );
+  const messages = await pullMessages(query.queueId, query.receiveToken, query.limit);
+  if (!messages) return reply.code(403).send({ error: 'Invalid queue capability.' });
 
   return {
-    data: result.rows.map(mapMessage),
+    data: messages,
     page: {
       limit: query.limit,
       nextCursor: null,
@@ -173,33 +147,58 @@ app.get('/messages/pull', async (request, reply) => {
 app.post('/messages/:id/delivered', async (request, reply) => {
   const params = z.object({ id: z.string().min(1) }).parse(request.params);
   const input = deliveredMessageInputSchema.parse(request.body);
-  const queue = await getQueueByReceiveToken(input.queueId, input.receiveToken);
-
-  if (!queue) {
-    return reply.code(403).send({ error: 'Invalid queue capability.' });
-  }
-
-  const result = await db.query<MessageRow>(
-    `DELETE FROM queued_messages
-     WHERE id = $1 AND queue_id = $2
-     RETURNING id, queue_id, client_message_id, envelope_version, ciphertext, nonce, byte_size, created_at, expires_at`,
-    [params.id, input.queueId],
-  );
-  const deleted = result.rows[0];
-
-  if (!deleted) {
-    return reply.code(404).send({ error: 'Message not found.' });
-  }
-
-  await incrementMetric(db, input.queueId, bucketHour(new Date(deleted.created_at)), 'delivered_count');
+  const delivered = await markDelivered(params.id, input.queueId, input.receiveToken);
+  if (delivered === 'forbidden') return reply.code(403).send({ error: 'Invalid queue capability.' });
+  if (!delivered) return reply.code(404).send({ error: 'Message not found.' });
+  notifyDelivered(delivered);
 
   return {
     data: {
-      id: deleted.id,
+      id: delivered.message.id,
       deleted: true,
-      deliveredAt: new Date().toISOString(),
+      deliveredAt: delivered.deliveredAt,
     },
   };
+});
+
+app.get('/ws', { websocket: true }, (socket, request) => {
+  const open = wsOpenInputSchema.safeParse(request.query);
+  if (!open.success) {
+    sendWs(socket, { type: 'error', message: 'Invalid websocket query.' });
+    socket.close(1008, 'Invalid websocket query');
+    return;
+  }
+
+  let opened = false;
+  const subscription = authorizeWs(open.data.queueId, open.data.receiveToken)
+    .then(async (authorized) => {
+      if (!authorized) {
+        sendWs(socket, { type: 'error', message: 'Invalid queue capability.' });
+        socket.close(1008, 'Invalid queue capability');
+        return;
+      }
+
+      opened = true;
+      addSubscriber(open.data.queueId, socket);
+      const pending = await pullMessages(open.data.queueId, open.data.receiveToken, 100);
+      sendWs(socket, { type: 'ready', queueId: open.data.queueId, pending: pending?.length ?? 0 });
+      for (const message of pending ?? []) {
+        sendWs(socket, { type: 'message.deliver', message });
+      }
+    })
+    .catch((error) => {
+      app.log.error({ error }, 'websocket open failed');
+      sendWs(socket, { type: 'error', message: 'Could not open websocket.' });
+      socket.close(1011, 'Could not open websocket');
+    });
+
+  socket.on('message', (raw) => {
+    void handleWsMessage(socket, raw, subscription);
+  });
+  socket.on('close', () => {
+    if (opened) removeSubscriber(open.data.queueId, socket);
+    removeSocketWatchers(socket);
+  });
 });
 
 app.post('/reports', async (request) => {
@@ -319,6 +318,132 @@ process.once('SIGTERM', async () => {
 const port = Number(process.env.CHAT_RELAY_PORT ?? 4088);
 await app.listen({ port, host: '0.0.0.0' });
 
+async function enqueueMessage(input: z.infer<typeof enqueueMessageInputSchema>) {
+  const queue = await getQueueBySendToken(input.queueId, input.sendToken);
+  if (!queue) return null;
+
+  const id = relayId('message');
+  const expiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000);
+  const bucketAt = bucketHour();
+  const byteSize = Buffer.byteLength(input.ciphertext, 'utf8');
+  const result = await db.query<MessageRow>(
+    `INSERT INTO queued_messages (
+       id, queue_id, client_message_id, envelope_version, ciphertext, nonce, byte_size, expires_at
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     RETURNING id, queue_id, client_message_id, envelope_version, ciphertext, nonce, byte_size, created_at, expires_at`,
+    [
+      id,
+      input.queueId,
+      input.clientMessageId ?? null,
+      input.envelopeVersion,
+      input.ciphertext,
+      input.nonce ?? null,
+      byteSize,
+      expiresAt.toISOString(),
+    ],
+  );
+
+  await incrementMetric(db, input.queueId, bucketAt, 'enqueued_count');
+  return mapMessage(result.rows[0]);
+}
+
+async function pullMessages(queueId: string, receiveToken: string, limit: number) {
+  const queue = await getQueueByReceiveToken(queueId, receiveToken);
+  if (!queue) return null;
+
+  const result = await db.query<MessageRow>(
+    `SELECT id, queue_id, client_message_id, envelope_version, ciphertext, nonce, byte_size, created_at, expires_at
+     FROM queued_messages
+     WHERE queue_id = $1 AND expires_at > now()
+     ORDER BY created_at ASC
+     LIMIT $2`,
+    [queueId, limit],
+  );
+
+  return result.rows.map(mapMessage).filter((message): message is QueuedMessage => Boolean(message));
+}
+
+async function markDelivered(messageId: string, queueId: string, receiveToken: string) {
+  const queue = await getQueueByReceiveToken(queueId, receiveToken);
+  if (!queue) return 'forbidden' as const;
+
+  const result = await db.query<MessageRow>(
+    `DELETE FROM queued_messages
+     WHERE id = $1 AND queue_id = $2
+     RETURNING id, queue_id, client_message_id, envelope_version, ciphertext, nonce, byte_size, created_at, expires_at`,
+    [messageId, queueId],
+  );
+  const deleted = result.rows[0];
+  if (!deleted) return null;
+
+  await incrementMetric(db, queueId, bucketHour(new Date(deleted.created_at)), 'delivered_count');
+  const message = mapMessage(deleted);
+  if (!message) return null;
+  return {
+    message,
+    deliveredAt: new Date().toISOString(),
+  };
+}
+
+async function authorizeWs(queueId: string, receiveToken: string) {
+  return Boolean(await getQueueByReceiveToken(queueId, receiveToken));
+}
+
+async function handleWsMessage(socket: WebSocket, raw: RawData, subscription: Promise<void>) {
+  await subscription;
+  if (socket.readyState !== socket.OPEN) return;
+
+  try {
+    const parsed = JSON.parse(raw.toString()) as Record<string, unknown>;
+    if (parsed.type === 'message.send') assertNoPlaintextFields(parsed);
+    const event = wsClientEventSchema.parse(parsed);
+
+    if (event.type === 'ping') {
+      sendWs(socket, { type: 'pong', at: new Date().toISOString() });
+      return;
+    }
+
+    if (event.type === 'message.send') {
+      const message = await enqueueMessage(event);
+      if (!message) {
+        sendWs(socket, { type: 'error', message: 'Invalid queue capability.' });
+        return;
+      }
+      watchDelivery(message.id, socket);
+      sendWs(socket, {
+        type: 'message.stored',
+        clientMessageId: event.clientMessageId,
+        messageId: message.id,
+        queueId: message.queueId,
+        createdAt: message.createdAt,
+      });
+      notifyQueue(message.queueId, message);
+      return;
+    }
+
+    const delivered = await markDelivered(event.messageId, event.queueId, event.receiveToken);
+    if (delivered === 'forbidden') {
+      sendWs(socket, { type: 'error', message: 'Invalid queue capability.' });
+      return;
+    }
+    if (!delivered) {
+      sendWs(socket, { type: 'error', message: 'Message not found.' });
+      return;
+    }
+    sendWs(socket, {
+      type: 'message.deleted',
+      messageId: delivered.message.id,
+      queueId: delivered.message.queueId,
+      deliveredAt: delivered.deliveredAt,
+    });
+    notifyDelivered(delivered);
+  } catch (error) {
+    app.log.warn({ error }, 'invalid websocket event');
+    sendWs(socket, { type: 'error', message: 'Invalid websocket event.' });
+  }
+}
+
 async function getQueueBySendToken(queueId: string, sendToken: string) {
   const result = await db.query<QueueRow>(
     `SELECT id, send_token_hash, receive_token_hash, status, created_at
@@ -328,6 +453,59 @@ async function getQueueBySendToken(queueId: string, sendToken: string) {
   );
 
   return result.rows[0];
+}
+
+function addSubscriber(queueId: string, socket: WebSocket) {
+  const current = subscribers.get(queueId) ?? new Set<WebSocket>();
+  current.add(socket);
+  subscribers.set(queueId, current);
+}
+
+function removeSubscriber(queueId: string, socket: WebSocket) {
+  const current = subscribers.get(queueId);
+  if (!current) return;
+  current.delete(socket);
+  if (!current.size) subscribers.delete(queueId);
+}
+
+function watchDelivery(messageId: string, socket: WebSocket) {
+  const current = deliveryWatchers.get(messageId) ?? new Set<WebSocket>();
+  current.add(socket);
+  deliveryWatchers.set(messageId, current);
+}
+
+function removeSocketWatchers(socket: WebSocket) {
+  for (const [messageId, sockets] of deliveryWatchers) {
+    sockets.delete(socket);
+    if (!sockets.size) deliveryWatchers.delete(messageId);
+  }
+}
+
+function notifyQueue(queueId: string, message: QueuedMessage | undefined) {
+  if (!message) return;
+  for (const socket of subscribers.get(queueId) ?? []) {
+    sendWs(socket, { type: 'message.deliver', message });
+  }
+}
+
+function notifyDelivered(delivered: { message: QueuedMessage; deliveredAt: string }) {
+  const sockets = deliveryWatchers.get(delivered.message.id);
+  if (!sockets) return;
+  for (const socket of sockets) {
+    sendWs(socket, {
+      type: 'message.delivered',
+      clientMessageId: delivered.message.clientMessageId,
+      messageId: delivered.message.id,
+      queueId: delivered.message.queueId,
+      deliveredAt: delivered.deliveredAt,
+    });
+  }
+  deliveryWatchers.delete(delivered.message.id);
+}
+
+function sendWs(socket: WebSocket, event: WsServerEvent) {
+  if (socket.readyState !== socket.OPEN) return;
+  socket.send(JSON.stringify(event));
 }
 
 async function getQueueByReceiveToken(queueId: string, receiveToken: string) {
