@@ -1,0 +1,9 @@
+zuri-chat.34.71.238.227.sslip.io {
+  encode gzip
+
+  handle_path /relay/* {
+    reverse_proxy chat-relay:4088
+  }
+
+  reverse_proxy chat-demo-web:5177
+}

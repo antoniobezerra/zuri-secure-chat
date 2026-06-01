@@ -92,6 +92,7 @@ type AppState = {
 function defaultRelayUrl() {
   const configured = import.meta.env.VITE_RELAY_URL as string | undefined;
   if (configured) return configured;
+  if (window.location.protocol === 'https:') return `${window.location.origin}/relay`;
   return `${window.location.protocol}//${window.location.hostname}:4088`;
 }
 
@@ -298,6 +299,9 @@ async function joinInvite() {
 
 async function setupLocalVault() {
   if (state.db && state.historyKey) return;
+  if (!crypto.subtle) {
+    throw new Error('Seu navegador bloqueou a criacao de chaves neste endereco. Abra pela URL HTTPS da Zuri.');
+  }
 
   const device = await generateDeviceKeyPair();
   const historyKey = await generateHistoryKey();
