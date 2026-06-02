@@ -130,6 +130,7 @@ const vaultPasswordMinLength = 14;
 let pollTimer: number | undefined;
 let claimTimer: number | undefined;
 let realtimeClient: ZuriSecureRealtimeClient | undefined;
+let localMessagesRenderVersion = 0;
 const sentStatuses = new Map<string, 'sending' | 'stored' | 'delivered'>();
 const initialVaults = loadVaultRegistry();
 
@@ -764,16 +765,31 @@ async function refreshLocalMessages() {
   const element = document.querySelector<HTMLDivElement>('#messages');
   if (!element || !state.db || !state.historyKey || !state.invite) return;
 
+  const renderVersion = ++localMessagesRenderVersion;
   const records = await listLocalMessages({
     db: state.db,
     historyKey: state.historyKey,
     conversationRef: conversationRef(),
   });
+  if (renderVersion !== localMessagesRenderVersion) return;
   if (!records.length) return;
 
   element.innerHTML = records
-    .map(({ message }) => {
+    .map(({ record, message }, index) => {
       const parsed = JSON.parse(message.body ?? '{}') as ChatMessage;
+      return {
+        index,
+        parsed,
+        recordCreatedAt: record.createdAt,
+        timestamp: chatMessageTimestamp(parsed, record.createdAt),
+      };
+    })
+    .sort((a, b) => (
+      a.timestamp - b.timestamp ||
+      Date.parse(a.recordCreatedAt) - Date.parse(b.recordCreatedAt) ||
+      a.index - b.index
+    ))
+    .map(({ parsed }) => {
       const mine = parsed.from === state.role;
       const status = mine && parsed.clientMessageId ? sentStatuses.get(parsed.clientMessageId) ?? 'stored' : undefined;
       return `
@@ -785,6 +801,13 @@ async function refreshLocalMessages() {
     })
     .join('');
   element.scrollTop = element.scrollHeight;
+}
+
+function chatMessageTimestamp(message: ChatMessage, fallback: string) {
+  const messageTimestamp = Date.parse(message.createdAt);
+  if (Number.isFinite(messageTimestamp)) return messageTimestamp;
+  const fallbackTimestamp = Date.parse(fallback);
+  return Number.isFinite(fallbackTimestamp) ? fallbackTimestamp : 0;
 }
 
 function syncPolling() {
