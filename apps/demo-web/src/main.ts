@@ -168,8 +168,8 @@ function render() {
   const canChat = isReady();
   const hasBackup = hasVaultBackup();
   const selectedVault = getSelectedVault();
-  const myName = state.role === 'a' ? 'Você: Alice' : state.role === 'b' ? 'Você: Bianca' : 'Sem sessão';
-  const peerName = state.role === 'a' ? 'Bianca' : 'Alice';
+  const myName = state.role ? 'Você' : 'Sem sessão';
+  const peerName = 'Outro participante';
   const peerSubtitle = canChat
     ? state.autoReceive ? `${realtimeLabel()} · WebSocket` : 'online · recebimento manual'
     : state.pendingInvite ? 'aguardando a outra pessoa aceitar' : 'aguardando convite seguro';
@@ -264,15 +264,15 @@ function render() {
         </section>
 
         <section class="contactList" aria-label="Contatos">
-          ${renderContact('Bianca', 'Contato seguro', canChat && state.role === 'a', canChat ? 'Chat ativo' : 'Crie ou cole um convite')}
-          ${renderContact('Alice', 'Contato seguro', canChat && state.role === 'b', canChat ? 'Chat ativo' : 'Crie ou cole um convite')}
+          ${renderContact('Conversa segura', 'Participante sem identidade pública', canChat, canChat ? 'Chat ativo' : 'Crie ou cole um convite')}
+          ${renderContact('Convite one-time', 'Entrada temporária', Boolean(state.pendingInvite), state.pendingInvite ? 'Aguardando aceite' : 'Pronto para criar')}
           ${renderContact('Observabilidade', 'Fila do relay', false, `${state.ops?.totals.pendingMessages ?? 0} pendente(s)`)}
         </section>
       </aside>
 
       <section class="chatPane">
         <header class="chatTop">
-          <div class="avatar">${escapeHtml(canChat ? peerName.charAt(0) : 'Z')}</div>
+          <div class="avatar">${escapeHtml(canChat ? 'P' : 'Z')}</div>
           <div>
             <strong>${escapeHtml(canChat ? peerName : 'Chat seguro')}</strong>
             <span class="presence"><i></i>${escapeHtml(peerSubtitle)}</span>
