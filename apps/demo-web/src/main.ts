@@ -91,6 +91,7 @@ type AppState = {
   adminToken: string;
   vaultUnlocked: boolean;
   vaultPasswordInput: string;
+  vaultPasswordVisible: boolean;
   role: Role | null;
   inviteText: string;
   messageText: string;
@@ -128,6 +129,7 @@ const state: AppState = {
   adminToken: 'zuri-demo-admin',
   vaultUnlocked: false,
   vaultPasswordInput: '',
+  vaultPasswordVisible: false,
   role: null,
   inviteText: inviteTextFromLocation(),
   messageText: '',
@@ -171,7 +173,12 @@ function render() {
             <button class="secondary" id="persist">Guardar storage do navegador</button>
           ` : `
             <label>Senha do cofre
-              <input id="vaultPassword" type="password" autocomplete="off" placeholder="Mínimo ${vaultPasswordMinLength} caracteres" value="${escapeHtml(state.vaultPasswordInput)}" />
+              <span class="passwordField">
+                <input id="vaultPassword" type="${state.vaultPasswordVisible ? 'text' : 'password'}" autocomplete="off" placeholder="Mínimo ${vaultPasswordMinLength} caracteres" value="${escapeHtml(state.vaultPasswordInput)}" />
+                <button class="passwordToggle" id="toggleVaultPassword" type="button" aria-label="${state.vaultPasswordVisible ? 'Ocultar senha' : 'Mostrar senha'}" title="${state.vaultPasswordVisible ? 'Ocultar senha' : 'Mostrar senha'}">
+                  ${renderEyeIcon(state.vaultPasswordVisible)}
+                </button>
+              </span>
             </label>
             <button id="unlockVault">Desbloquear cofre</button>
           `}
@@ -288,6 +295,11 @@ function bind() {
       event.preventDefault();
       void run(unlockVault);
     }
+  });
+  document.querySelector<HTMLButtonElement>('#toggleVaultPassword')?.addEventListener('click', () => {
+    state.vaultPasswordVisible = !state.vaultPasswordVisible;
+    render();
+    document.querySelector<HTMLInputElement>('#vaultPassword')?.focus();
   });
   document.querySelector<HTMLButtonElement>('#unlockVault')?.addEventListener('click', () => run(unlockVault));
   document.querySelector<HTMLButtonElement>('#lockVault')?.addEventListener('click', () => {
@@ -422,6 +434,7 @@ async function unlockVault() {
   state.db = db;
   state.vaultUnlocked = true;
   state.vaultPasswordInput = '';
+  state.vaultPasswordVisible = false;
   state.log.unshift('Cofre local desbloqueado. A senha não foi salva.');
 }
 
@@ -660,6 +673,7 @@ function lockVault(reason = 'Cofre local bloqueado.') {
   claimTimer = undefined;
   state.vaultUnlocked = false;
   state.vaultPasswordInput = '';
+  state.vaultPasswordVisible = false;
   state.realtimeStatus = 'offline';
   state.historyKey = undefined;
   state.chatKey = undefined;
@@ -794,6 +808,26 @@ function renderReceipt(status: 'sending' | 'stored' | 'delivered') {
   if (status === 'delivered') return '✓✓';
   if (status === 'stored') return '✓';
   return '...';
+}
+
+function renderEyeIcon(visible: boolean) {
+  if (visible) {
+    return `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 3l18 18" />
+        <path d="M10.6 10.6a2.5 2.5 0 0 0 3.4 3.4" />
+        <path d="M9.9 4.2A10.8 10.8 0 0 1 12 4c5.2 0 8.7 4.3 10 8a12.2 12.2 0 0 1-2.4 3.8" />
+        <path d="M6.4 6.5A12.3 12.3 0 0 0 2 12c1.3 3.7 4.8 8 10 8 1.5 0 2.8-.3 4-.9" />
+      </svg>
+    `;
+  }
+
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M2 12s3.7-7 10-7 10 7 10 7-3.7 7-10 7S2 12 2 12z" />
+      <path d="M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4z" />
+    </svg>
+  `;
 }
 
 function conversationRef() {
