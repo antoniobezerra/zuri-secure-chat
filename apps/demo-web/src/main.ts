@@ -144,7 +144,8 @@ function render() {
     <main class="phoneShell">
       <aside class="contactPane">
         <header class="contactHeader">
-          <div>
+          <div class="brandLock">Z</div>
+          <div class="brandCopy">
             <strong>Zuri Chat</strong>
             <span>A segurança é nossa. A conversa é sua.</span>
           </div>
@@ -152,7 +153,10 @@ function render() {
         </header>
 
         <section class="setupCard">
-          <h2>Começar conversa</h2>
+          <div class="sectionTitle">
+            <h2>Começar conversa</h2>
+            <span>One-time</span>
+          </div>
           <p>Use duas janelas. Uma cria o convite; a outra cola e entra.</p>
           <label>Relay
             <input id="relayUrl" value="${escapeHtml(state.relayUrl)}" />
@@ -179,7 +183,7 @@ function render() {
           <div class="avatar">${escapeHtml(canChat ? peerName.charAt(0) : 'Z')}</div>
           <div>
             <strong>${escapeHtml(canChat ? peerName : 'Chat seguro')}</strong>
-            <span>${escapeHtml(peerSubtitle)}</span>
+            <span class="presence"><i></i>${escapeHtml(peerSubtitle)}</span>
           </div>
           <div class="chatTopActions">
             <button class="ghost" id="toggleAuto">${state.autoReceive ? 'WS ligado' : 'WS desligado'}</button>
@@ -196,7 +200,8 @@ function render() {
           ` : ''}
           <div class="notice">
             <strong>${escapeHtml(myName)}</strong>
-            <span>O servidor não recebe texto puro. Código da conversa: ${escapeHtml(state.invite?.securityCode ?? 'aguardando')}</span>
+            <span>O servidor não recebe texto puro.</span>
+            <em>${escapeHtml(state.invite?.securityCode ?? 'aguardando')}</em>
           </div>
           <div id="messages" class="messages">
             <div class="empty">As mensagens aparecem aqui. Envie numa janela e veja chegar na outra automaticamente.</div>
@@ -244,7 +249,7 @@ function renderContact(name: string, kind: string, active: boolean, meta: string
         <strong>${escapeHtml(name)}</strong>
         <small>${escapeHtml(kind)}</small>
       </div>
-      <em>${escapeHtml(meta)}</em>
+      <em><i></i>${escapeHtml(meta)}</em>
     </article>
   `;
 }
