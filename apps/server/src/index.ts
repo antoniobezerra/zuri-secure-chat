@@ -1,12 +1,15 @@
 import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import {
+  acceptInviteInputSchema,
   assertNoPlaintextFields,
+  claimInviteInputSchema,
   createReportInputSchema,
   deliveredMessageInputSchema,
   enqueueMessageInputSchema,
   pullMessagesQuerySchema,
   RELAY_PRODUCT,
+  type RelayConnectionBundle,
   type QueuedMessage,
   type WsServerEvent,
   wsClientEventSchema,
@@ -15,9 +18,18 @@ import {
 import Fastify from 'fastify';
 import { z } from 'zod';
 import type { RawData, WebSocket } from 'ws';
+import { serverConfig } from './config.js';
 import { Database } from './db.js';
 import { incrementMetric } from './metrics.js';
-import { bucketHour, capabilityToken, ciphertextHash, relayId, tokenHash } from './security.js';
+import {
+  bucketHour,
+  capabilityToken,
+  ciphertextHash,
+  decryptJsonWithSecret,
+  encryptJsonWithSecret,
+  relayId,
+  tokenHash,
+} from './security.js';
 
 type QueueRow = {
   id: string;
@@ -37,6 +49,23 @@ type MessageRow = {
   byte_size: number;
   created_at: Date | string;
   expires_at: Date | string;
+};
+
+type InviteRow = {
+  id: string;
+  secret_hash: string;
+  creator_token_hash: string | null;
+  status: 'pending' | 'consumed' | 'expired' | 'revoked';
+  attempt_count: number;
+  bundle_ciphertext: string | null;
+  bundle_nonce: string | null;
+  creator_bundle_ciphertext: string | null;
+  creator_bundle_nonce: string | null;
+  created_at: Date | string;
+  expires_at: Date | string;
+  consumed_at: Date | string | null;
+  creator_claimed_at: Date | string | null;
+  revoked_at: Date | string | null;
 };
 
 type AdminQueueRow = {
@@ -70,15 +99,29 @@ type MetricRow = {
 };
 
 const db = new Database();
-const app = Fastify({ logger: true });
-const ttlDays = Number(process.env.MESSAGE_TTL_DAYS ?? 30);
-const adminToken = process.env.ADMIN_TOKEN;
+const app = Fastify({
+  logger: {
+    serializers: {
+      req(request) {
+        const url = serverConfig.logQueryString ? request.url : request.url.split('?')[0];
+        return {
+          method: request.method,
+          url,
+          hostname: request.hostname,
+          remoteAddress: serverConfig.ipLogRetentionHours > 0 ? request.ip : undefined,
+        };
+      },
+    },
+  },
+});
+const adminToken = serverConfig.adminToken;
 const subscribers = new Map<string, Set<WebSocket>>();
 const deliveryWatchers = new Map<string, Set<WebSocket>>();
+const rateLimits = new Map<string, { resetAt: number; count: number }>();
 
 await app.register(websocket, {
   options: {
-    maxPayload: 512 * 1024,
+    maxPayload: serverConfig.maxWebsocketPayloadBytes,
   },
 });
 await app.register(cors, {
@@ -92,25 +135,79 @@ app.get('/health', async () => ({
   time: new Date().toISOString(),
 }));
 
-app.post('/queues', async () => {
-  const id = relayId('queue');
-  const sendToken = capabilityToken();
-  const receiveToken = capabilityToken();
-  const result = await db.query<QueueRow>(
-    `INSERT INTO queues (id, send_token_hash, receive_token_hash)
-     VALUES ($1, $2, $3)
-     RETURNING id, status, created_at, send_token_hash, receive_token_hash`,
-    [id, tokenHash(sendToken), tokenHash(receiveToken)],
+app.post('/invites', async (request, reply) => {
+  if (!checkRateLimit(`invite:create:${request.ip}`)) return reply.code(429).send({ error: 'Rate limit exceeded.' });
+
+  const invite = await createInvite();
+  return {
+    data: invite,
+  };
+});
+
+app.post('/invites/:id/accept', async (request, reply) => {
+  const params = z.object({ id: z.string().min(8).max(160) }).parse(request.params);
+  const input = acceptInviteInputSchema.parse(request.body);
+  if (!checkRateLimit(`invite:accept:${request.ip}:${params.id}`)) {
+    return reply.code(429).send({ error: 'Rate limit exceeded.' });
+  }
+
+  const accepted = await acceptInvite(params.id, input.inviteSecret);
+  if (accepted.kind === 'ok') {
+    return {
+      data: accepted.data,
+    };
+  }
+
+  return reply.code(accepted.statusCode).send({ error: accepted.message });
+});
+
+app.post('/invites/:id/claim', async (request, reply) => {
+  const params = z.object({ id: z.string().min(8).max(160) }).parse(request.params);
+  const input = claimInviteInputSchema.parse(request.body);
+  if (!checkRateLimit(`invite:claim:${request.ip}:${params.id}`)) {
+    return reply.code(429).send({ error: 'Rate limit exceeded.' });
+  }
+
+  const claimed = await claimInvite(params.id, input.creatorClaimToken);
+  if (claimed.kind === 'ok') {
+    return {
+      data: claimed.data,
+    };
+  }
+
+  return reply.code(claimed.statusCode).send({ error: claimed.message });
+});
+
+app.post('/invites/:id/revoke', async (request, reply) => {
+  if (!authorizeAdmin(request.headers['x-admin-token'])) {
+    return reply.code(401).send({ error: 'Invalid admin token.' });
+  }
+  const params = z.object({ id: z.string().min(8).max(160) }).parse(request.params);
+  const result = await db.query<InviteRow>(
+    `UPDATE chat_invites
+     SET status = 'revoked', revoked_at = now(), bundle_ciphertext = NULL, bundle_nonce = NULL,
+       creator_bundle_ciphertext = NULL, creator_bundle_nonce = NULL
+     WHERE id = $1 AND status = 'pending'
+     RETURNING id, secret_hash, creator_token_hash, status, attempt_count, bundle_ciphertext, bundle_nonce,
+       creator_bundle_ciphertext, creator_bundle_nonce, created_at, expires_at, consumed_at, creator_claimed_at, revoked_at`,
+    [params.id],
   );
   const row = result.rows[0];
-
+  if (!row) return reply.code(404).send({ error: 'Invite not found or not pending.' });
   return {
     data: {
-      queueId: id,
-      sendToken,
-      receiveToken,
-      createdAt: iso(row?.created_at),
+      inviteId: row.id,
+      status: row.status,
+      revokedAt: iso(row.revoked_at ?? new Date().toISOString()),
     },
+  };
+});
+
+app.post('/queues', async (request, reply) => {
+  if (!checkRateLimit(`queue:create:${request.ip}`)) return reply.code(429).send({ error: 'Rate limit exceeded.' });
+  const queue = await createQueue();
+  return {
+    data: queue,
   };
 });
 
@@ -118,6 +215,9 @@ app.post('/messages/enqueue', async (request, reply) => {
   const raw = request.body as Record<string, unknown>;
   assertNoPlaintextFields(raw);
   const input = enqueueMessageInputSchema.parse(raw);
+  if (!checkRateLimit(`message:send:${request.ip}:${input.queueId}`)) {
+    return reply.code(429).send({ error: 'Rate limit exceeded.' });
+  }
   const message = await enqueueMessage(input);
   if (!message) return reply.code(403).send({ error: 'Invalid queue capability.' });
   notifyQueue(message.queueId, message);
@@ -318,14 +418,220 @@ process.once('SIGTERM', async () => {
 const port = Number(process.env.CHAT_RELAY_PORT ?? 4088);
 await app.listen({ port, host: '0.0.0.0' });
 
+async function createQueue() {
+  const id = relayId('queue');
+  const sendToken = capabilityToken(serverConfig.tokenBytes);
+  const receiveToken = capabilityToken(serverConfig.tokenBytes);
+  const result = await db.query<QueueRow>(
+    `INSERT INTO queues (id, send_token_hash, receive_token_hash)
+     VALUES ($1, $2, $3)
+     RETURNING id, status, created_at, send_token_hash, receive_token_hash`,
+    [id, tokenHash(sendToken, serverConfig.hashPepper), tokenHash(receiveToken, serverConfig.hashPepper)],
+  );
+  const row = result.rows[0];
+
+  return {
+    queueId: id,
+    sendToken,
+    receiveToken,
+    createdAt: iso(row?.created_at),
+  };
+}
+
+async function createInvite() {
+  const inviteId = relayId('invite');
+  const inviteSecret = capabilityToken(serverConfig.tokenBytes);
+  const creatorClaimToken = capabilityToken(serverConfig.tokenBytes);
+  const bundle: RelayConnectionBundle = {
+    aToB: await createQueue(),
+    bToA: await createQueue(),
+  };
+  const encryptedBundle = encryptJsonWithSecret(bundle, inviteSecret, serverConfig.hashPepper);
+  const encryptedCreatorBundle = encryptJsonWithSecret(bundle, creatorClaimToken, serverConfig.hashPepper);
+  const expiresAt = new Date(Date.now() + serverConfig.inviteTtlSeconds * 1000);
+  const result = await db.query<InviteRow>(
+    `INSERT INTO chat_invites (
+       id, secret_hash, creator_token_hash, status, attempt_count, bundle_ciphertext, bundle_nonce,
+       creator_bundle_ciphertext, creator_bundle_nonce, expires_at
+     )
+     VALUES ($1, $2, $3, 'pending', 0, $4, $5, $6, $7, $8)
+     RETURNING id, secret_hash, creator_token_hash, status, attempt_count, bundle_ciphertext, bundle_nonce,
+       creator_bundle_ciphertext, creator_bundle_nonce, created_at, expires_at, consumed_at, creator_claimed_at, revoked_at`,
+    [
+      inviteId,
+      tokenHash(inviteSecret, serverConfig.hashPepper),
+      tokenHash(creatorClaimToken, serverConfig.hashPepper),
+      encryptedBundle.ciphertext,
+      encryptedBundle.nonce,
+      encryptedCreatorBundle.ciphertext,
+      encryptedCreatorBundle.nonce,
+      expiresAt.toISOString(),
+    ],
+  );
+  const row = result.rows[0];
+
+  return {
+    inviteId,
+    inviteSecret,
+    creatorClaimToken,
+    status: row?.status ?? 'pending',
+    createdAt: iso(row?.created_at),
+    expiresAt: iso(row?.expires_at),
+  };
+}
+
+async function acceptInvite(inviteId: string, inviteSecret: string) {
+  const currentResult = await db.query<InviteRow>(
+    `SELECT id, secret_hash, creator_token_hash, status, attempt_count, bundle_ciphertext, bundle_nonce,
+       creator_bundle_ciphertext, creator_bundle_nonce, created_at, expires_at, consumed_at, creator_claimed_at, revoked_at
+     FROM chat_invites
+     WHERE id = $1`,
+    [inviteId],
+  );
+  const invite = currentResult.rows[0];
+  if (!invite) return inviteError(404, 'Invite not found.');
+
+  if (invite.status === 'consumed') return inviteError(409, 'Invite already used.');
+  if (invite.status === 'revoked') return inviteError(410, 'Invite revoked.');
+  if (invite.status === 'expired' || new Date(invite.expires_at).getTime() <= Date.now()) {
+    await expireInvite(invite.id);
+    return inviteError(410, 'Invite expired.');
+  }
+  if (invite.attempt_count >= serverConfig.inviteMaxAttempts) return inviteError(429, 'Invite attempt limit exceeded.');
+
+  if (invite.secret_hash !== tokenHash(inviteSecret, serverConfig.hashPepper)) {
+    await db.query(`UPDATE chat_invites SET attempt_count = attempt_count + 1 WHERE id = $1`, [invite.id]);
+    return inviteError(403, 'Invalid invite secret.');
+  }
+  const consumeResult = await db.query<InviteRow>(
+    `UPDATE chat_invites
+     SET status = $3, consumed_at = now(),
+       bundle_ciphertext = CASE WHEN $4::boolean THEN NULL ELSE bundle_ciphertext END,
+       bundle_nonce = CASE WHEN $4::boolean THEN NULL ELSE bundle_nonce END
+     WHERE id = $1
+       AND secret_hash = $2
+       AND status = 'pending'
+       AND expires_at > now()
+       AND attempt_count < $5
+       AND bundle_ciphertext IS NOT NULL
+       AND bundle_nonce IS NOT NULL
+     RETURNING id, secret_hash, creator_token_hash, status, attempt_count, bundle_ciphertext, bundle_nonce,
+       creator_bundle_ciphertext, creator_bundle_nonce, created_at, expires_at, consumed_at, creator_claimed_at, revoked_at`,
+    [
+      invite.id,
+      tokenHash(inviteSecret, serverConfig.hashPepper),
+      serverConfig.inviteOneTime ? 'consumed' : 'pending',
+      serverConfig.inviteOneTime,
+      serverConfig.inviteMaxAttempts,
+    ],
+  );
+  const consumed = consumeResult.rows[0];
+  if (!consumed) return inviteError(409, 'Invite already used.');
+  const bundleCiphertext = consumed.bundle_ciphertext ?? invite.bundle_ciphertext;
+  const bundleNonce = consumed.bundle_nonce ?? invite.bundle_nonce;
+  if (!bundleCiphertext || !bundleNonce) return inviteError(410, 'Invite bundle unavailable.');
+
+  const bundle = decryptJsonWithSecret<RelayConnectionBundle>(
+    bundleCiphertext,
+    bundleNonce,
+    inviteSecret,
+    serverConfig.hashPepper,
+  );
+
+  return {
+    kind: 'ok' as const,
+    data: {
+      inviteId: invite.id,
+      status: 'consumed' as const,
+      consumedAt: iso(consumed.consumed_at ?? new Date().toISOString()),
+      bundle,
+    },
+  };
+}
+
+async function claimInvite(inviteId: string, creatorClaimToken: string) {
+  const currentResult = await db.query<InviteRow>(
+    `SELECT id, secret_hash, creator_token_hash, status, attempt_count, bundle_ciphertext, bundle_nonce,
+       creator_bundle_ciphertext, creator_bundle_nonce, created_at, expires_at, consumed_at, creator_claimed_at, revoked_at
+     FROM chat_invites
+     WHERE id = $1`,
+    [inviteId],
+  );
+  const invite = currentResult.rows[0];
+  if (!invite) return inviteError(404, 'Invite not found.');
+  if (invite.status === 'pending') return inviteError(409, 'Invite not accepted yet.');
+  if (invite.status === 'expired') return inviteError(410, 'Invite expired.');
+  if (invite.status === 'revoked') return inviteError(410, 'Invite revoked.');
+  if (invite.creator_claimed_at) return inviteError(409, 'Invite bundle already claimed.');
+  if (!invite.creator_token_hash || invite.creator_token_hash !== tokenHash(creatorClaimToken, serverConfig.hashPepper)) {
+    return inviteError(403, 'Invalid creator claim token.');
+  }
+  if (!invite.creator_bundle_ciphertext || !invite.creator_bundle_nonce) {
+    return inviteError(410, 'Invite bundle unavailable.');
+  }
+
+  const claimResult = await db.query<InviteRow>(
+    `UPDATE chat_invites
+     SET creator_claimed_at = now(), creator_bundle_ciphertext = NULL, creator_bundle_nonce = NULL
+     WHERE id = $1
+       AND status = 'consumed'
+       AND creator_token_hash = $2
+       AND creator_claimed_at IS NULL
+       AND creator_bundle_ciphertext IS NOT NULL
+       AND creator_bundle_nonce IS NOT NULL
+     RETURNING id, secret_hash, creator_token_hash, status, attempt_count, bundle_ciphertext, bundle_nonce,
+       creator_bundle_ciphertext, creator_bundle_nonce, created_at, expires_at, consumed_at, creator_claimed_at, revoked_at`,
+    [invite.id, tokenHash(creatorClaimToken, serverConfig.hashPepper)],
+  );
+  const claimed = claimResult.rows[0];
+  if (!claimed) return inviteError(409, 'Invite bundle already claimed.');
+  const bundle = decryptJsonWithSecret<RelayConnectionBundle>(
+    invite.creator_bundle_ciphertext,
+    invite.creator_bundle_nonce,
+    creatorClaimToken,
+    serverConfig.hashPepper,
+  );
+
+  return {
+    kind: 'ok' as const,
+    data: {
+      inviteId: invite.id,
+      status: 'consumed' as const,
+      claimedAt: iso(claimed.creator_claimed_at ?? new Date().toISOString()),
+      bundle,
+    },
+  };
+}
+
+function inviteError(statusCode: number, message: string) {
+  return {
+    kind: 'error' as const,
+    statusCode,
+    message,
+  };
+}
+
+async function expireInvite(inviteId: string) {
+  await db.query(
+    `UPDATE chat_invites
+     SET status = 'expired', bundle_ciphertext = NULL, bundle_nonce = NULL,
+       creator_bundle_ciphertext = NULL, creator_bundle_nonce = NULL
+     WHERE id = $1 AND status = 'pending'`,
+    [inviteId],
+  );
+}
+
 async function enqueueMessage(input: z.infer<typeof enqueueMessageInputSchema>) {
   const queue = await getQueueBySendToken(input.queueId, input.sendToken);
   if (!queue) return null;
 
-  const id = relayId('message');
-  const expiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000);
-  const bucketAt = bucketHour();
   const byteSize = Buffer.byteLength(input.ciphertext, 'utf8');
+  if (byteSize > serverConfig.maxMessageBytes) return null;
+  if (!(await canQueueMoreMessages(input.queueId))) return null;
+
+  const id = relayId('message');
+  const expiresAt = new Date(Date.now() + serverConfig.messageTtlDays * 24 * 60 * 60 * 1000);
+  const bucketAt = bucketHour();
   const result = await db.query<MessageRow>(
     `INSERT INTO queued_messages (
        id, queue_id, client_message_id, envelope_version, ciphertext, nonce, byte_size, expires_at
@@ -362,6 +668,16 @@ async function pullMessages(queueId: string, receiveToken: string, limit: number
   );
 
   return result.rows.map(mapMessage).filter((message): message is QueuedMessage => Boolean(message));
+}
+
+async function canQueueMoreMessages(queueId: string) {
+  const result = await db.query<{ pending_count: string | number }>(
+    `SELECT count(*) AS pending_count
+     FROM queued_messages
+     WHERE queue_id = $1 AND expires_at > now()`,
+    [queueId],
+  );
+  return Number(result.rows[0]?.pending_count ?? 0) < serverConfig.maxPendingMessagesPerQueue;
 }
 
 async function markDelivered(messageId: string, queueId: string, receiveToken: string) {
@@ -405,6 +721,10 @@ async function handleWsMessage(socket: WebSocket, raw: RawData, subscription: Pr
     }
 
     if (event.type === 'message.send') {
+      if (!checkRateLimit(`ws:send:${event.queueId}`)) {
+        sendWs(socket, { type: 'error', message: 'Rate limit exceeded.' });
+        return;
+      }
       const message = await enqueueMessage(event);
       if (!message) {
         sendWs(socket, { type: 'error', message: 'Invalid queue capability.' });
@@ -449,7 +769,7 @@ async function getQueueBySendToken(queueId: string, sendToken: string) {
     `SELECT id, send_token_hash, receive_token_hash, status, created_at
      FROM queues
      WHERE id = $1 AND send_token_hash = $2 AND status = 'active'`,
-    [queueId, tokenHash(sendToken)],
+    [queueId, tokenHash(sendToken, serverConfig.hashPepper)],
   );
 
   return result.rows[0];
@@ -513,7 +833,7 @@ async function getQueueByReceiveToken(queueId: string, receiveToken: string) {
     `SELECT id, send_token_hash, receive_token_hash, status, created_at
      FROM queues
      WHERE id = $1 AND receive_token_hash = $2 AND status = 'active'`,
-    [queueId, tokenHash(receiveToken)],
+    [queueId, tokenHash(receiveToken, serverConfig.hashPepper)],
   );
 
   return result.rows[0];
@@ -565,6 +885,20 @@ function authorizeAdmin(input: string | string[] | undefined) {
   if (!adminToken) return process.env.NODE_ENV !== 'production';
   const token = Array.isArray(input) ? input[0] : input;
   return token === adminToken;
+}
+
+function checkRateLimit(key: string) {
+  const now = Date.now();
+  const current = rateLimits.get(key);
+  if (!current || current.resetAt <= now) {
+    rateLimits.set(key, {
+      count: 1,
+      resetAt: now + serverConfig.rateLimitWindowSeconds * 1000,
+    });
+    return true;
+  }
+  current.count += 1;
+  return current.count <= serverConfig.rateLimitMaxEvents;
 }
 
 function iso(value: Date | string | undefined) {

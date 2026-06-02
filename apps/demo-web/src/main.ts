@@ -12,7 +12,7 @@ import {
   ZuriSecureRelayClient,
   type VaultBackup,
 } from '@zuri-secure-chat/web-sdk';
-import type { QueuedMessage, WsServerEvent } from '@zuri-secure-chat/protocol';
+import type { QueuedMessage, RelayConnectionBundle, WsServerEvent } from '@zuri-secure-chat/protocol';
 import './style.css';
 
 type Direction = {
@@ -23,11 +23,31 @@ type Direction = {
 
 type Invite = {
   version: 1;
+  inviteId: string;
   relayUrl: string;
   chatKey: JsonWebKey;
   aToB: Direction;
   bToA: Direction;
+  expiresAt: string;
   createdAt: string;
+  securityCode: string;
+};
+
+type InviteLinkPayload = {
+  version: 1;
+  inviteId: string;
+  relayUrl: string;
+  inviteSecret: string;
+  chatKey: JsonWebKey;
+  expiresAt: string;
+};
+
+type PendingInvite = {
+  inviteId: string;
+  relayUrl: string;
+  creatorClaimToken: string;
+  chatKey: JsonWebKey;
+  expiresAt: string;
 };
 
 type Role = 'a' | 'b';
@@ -82,9 +102,11 @@ type AppState = {
   chatKey?: CryptoKey;
   db?: IDBDatabase;
   invite?: Invite;
+  pendingInvite?: PendingInvite;
 };
 
 let pollTimer: number | undefined;
+let claimTimer: number | undefined;
 let realtimeClient: ZuriSecureRealtimeClient | undefined;
 const sentStatuses = new Map<string, 'sending' | 'stored' | 'delivered'>();
 
@@ -99,7 +121,7 @@ const state: AppState = {
   relayUrl: defaultRelayUrl(),
   adminToken: 'zuri-demo-admin',
   role: null,
-  inviteText: '',
+  inviteText: inviteTextFromLocation(),
   messageText: '',
   log: [],
   autoReceive: true,
@@ -116,7 +138,7 @@ function render() {
   const peerName = state.role === 'a' ? 'Bianca' : 'Alice';
   const peerSubtitle = canChat
     ? state.autoReceive ? `${realtimeLabel()} · WebSocket` : 'online · recebimento manual'
-    : 'aguardando convite seguro';
+    : state.pendingInvite ? 'aguardando a outra pessoa aceitar' : 'aguardando convite seguro';
 
   document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     <main class="phoneShell">
@@ -137,10 +159,10 @@ function render() {
           </label>
           <div class="setupActions">
             <button id="createInvite">Criar convite</button>
-            <button class="secondary" id="copyInvite" ${state.invite ? '' : 'disabled'}>Copiar</button>
+            <button class="secondary" id="copyInvite" ${state.inviteText ? '' : 'disabled'}>Copiar</button>
           </div>
           <label>Convite recebido
-            <textarea id="inviteInput" placeholder="Cole aqui o convite da outra pessoa">${escapeHtml(state.inviteText)}</textarea>
+            <textarea id="inviteInput" placeholder="Cole aqui o link one-time da outra pessoa">${escapeHtml(state.inviteText)}</textarea>
           </label>
           <button class="secondary" id="joinInvite">Entrar na conversa</button>
         </section>
@@ -166,15 +188,15 @@ function render() {
         </header>
 
         <section class="chatBody">
-          ${state.invite ? `
+          ${state.invite || state.pendingInvite ? `
             <details class="inviteDrawer">
-              <summary>Convite desta conversa</summary>
-              <textarea readonly>${escapeHtml(encodeInvite(state.invite))}</textarea>
+              <summary>Convite one-time desta conversa</summary>
+              <textarea readonly>${escapeHtml(state.inviteText)}</textarea>
             </details>
           ` : ''}
           <div class="notice">
             <strong>${escapeHtml(myName)}</strong>
-            <span>O servidor não recebe texto puro. Ele só guarda envelope criptografado até a entrega.</span>
+            <span>O servidor não recebe texto puro. Código da conversa: ${escapeHtml(state.invite?.securityCode ?? 'aguardando')}</span>
           </div>
           <div id="messages" class="messages">
             <div class="empty">As mensagens aparecem aqui. Envie numa janela e veja chegar na outra automaticamente.</div>
@@ -264,36 +286,64 @@ function bind() {
 async function createInvite() {
   await setupLocalVault();
   const client = new ZuriSecureRelayClient({ relayUrl: state.relayUrl });
-  const queues = await Promise.all([client.createQueue(), client.createQueue()]) as [
-    { data: Direction },
-    { data: Direction },
-  ];
-  const chatKey = await generateHistoryKey();
-  const invite: Invite = {
-    version: 1,
-    relayUrl: state.relayUrl,
-    chatKey: await crypto.subtle.exportKey('jwk', chatKey),
-    aToB: queues[0].data,
-    bToA: queues[1].data,
-    createdAt: new Date().toISOString(),
+  const response = (await client.createInvite()) as {
+    data: {
+      inviteId: string;
+      inviteSecret: string;
+      creatorClaimToken: string;
+      expiresAt: string;
+    };
   };
+  const chatKey = await generateHistoryKey();
+  const chatKeyJwk = await crypto.subtle.exportKey('jwk', chatKey);
 
   state.role = 'a';
   state.chatKey = chatKey;
-  state.invite = invite;
-  state.inviteText = encodeInvite(invite);
-  state.log.unshift('Convite criado. Copie e cole na segunda janela.');
-  syncRealtime();
+  state.invite = undefined;
+  state.pendingInvite = {
+    inviteId: response.data.inviteId,
+    relayUrl: state.relayUrl,
+    creatorClaimToken: response.data.creatorClaimToken,
+    chatKey: chatKeyJwk,
+    expiresAt: response.data.expiresAt,
+  };
+  state.inviteText = encodeInviteLink({
+    version: 1,
+    inviteId: response.data.inviteId,
+    relayUrl: state.relayUrl,
+    inviteSecret: response.data.inviteSecret,
+    chatKey: chatKeyJwk,
+    expiresAt: response.data.expiresAt,
+  });
+  state.log.unshift('Convite one-time criado. Aguardando a outra janela aceitar para abrir o chat.');
+  syncClaiming();
 }
 
 async function joinInvite() {
-  const invite = decodeInvite(state.inviteText.trim());
+  const inviteLink = decodeInviteLink(state.inviteText.trim());
   await setupLocalVault();
+  const client = new ZuriSecureRelayClient({ relayUrl: inviteLink.relayUrl });
+  const accepted = await client.acceptInvite({
+    inviteId: inviteLink.inviteId,
+    inviteSecret: inviteLink.inviteSecret,
+  });
+  const securityCode = await conversationSecurityCode(accepted.data.bundle, inviteLink.chatKey);
+  const invite: Invite = {
+    version: 1,
+    inviteId: accepted.data.inviteId,
+    relayUrl: inviteLink.relayUrl,
+    chatKey: inviteLink.chatKey,
+    aToB: accepted.data.bundle.aToB,
+    bToA: accepted.data.bundle.bToA,
+    expiresAt: inviteLink.expiresAt,
+    createdAt: accepted.data.consumedAt,
+    securityCode,
+  };
   state.role = 'b';
-  state.relayUrl = invite.relayUrl;
+  state.relayUrl = inviteLink.relayUrl;
   state.invite = invite;
-  state.chatKey = await crypto.subtle.importKey('jwk', invite.chatKey, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
-  state.log.unshift('Você entrou na conversa. O WebSocket está ligado.');
+  state.chatKey = await crypto.subtle.importKey('jwk', inviteLink.chatKey, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+  state.log.unshift('Convite aceito. Se outra pessoa tentar usar o mesmo link, o relay recusa.');
   syncRealtime();
 }
 
@@ -318,9 +368,9 @@ async function persistStorage() {
 }
 
 async function copyInvite() {
-  if (!state.invite) throw new Error('Crie o convite primeiro.');
-  await navigator.clipboard.writeText(encodeInvite(state.invite));
-  state.log.unshift('Convite copiado. Cole na outra janela.');
+  if (!state.inviteText) throw new Error('Crie o convite primeiro.');
+  await navigator.clipboard.writeText(state.inviteText);
+  state.log.unshift('Link one-time copiado. Cole na outra janela.');
 }
 
 async function sendMessage() {
@@ -540,6 +590,56 @@ function syncRealtime() {
   realtimeClient.connect();
 }
 
+function syncClaiming() {
+  if (claimTimer) {
+    window.clearInterval(claimTimer);
+    claimTimer = undefined;
+  }
+  if (!state.pendingInvite) return;
+
+  claimTimer = window.setInterval(() => {
+    if (document.hidden || !state.pendingInvite) return;
+    void claimCreatorBundle().catch((error) => {
+      const message = error instanceof Error ? error.message : 'Falha ao verificar aceite.';
+      if (!message.includes('409')) {
+        state.log.unshift(message);
+        render();
+      }
+    });
+  }, 2000);
+  void claimCreatorBundle().catch(() => undefined);
+}
+
+async function claimCreatorBundle() {
+  if (!state.pendingInvite || !state.chatKey) return;
+  const pending = state.pendingInvite;
+  const client = new ZuriSecureRelayClient({ relayUrl: pending.relayUrl });
+  const claimed = await client.claimInvite({
+    inviteId: pending.inviteId,
+    creatorClaimToken: pending.creatorClaimToken,
+  });
+  if (claimTimer) {
+    window.clearInterval(claimTimer);
+    claimTimer = undefined;
+  }
+  const securityCode = await conversationSecurityCode(claimed.data.bundle, pending.chatKey);
+  state.invite = {
+    version: 1,
+    inviteId: claimed.data.inviteId,
+    relayUrl: pending.relayUrl,
+    chatKey: pending.chatKey,
+    aToB: claimed.data.bundle.aToB,
+    bToA: claimed.data.bundle.bToA,
+    expiresAt: pending.expiresAt,
+    createdAt: claimed.data.claimedAt,
+    securityCode,
+  };
+  state.pendingInvite = undefined;
+  state.log.unshift('A outra janela aceitou. Chat conectado com convite one-time consumido.');
+  syncRealtime();
+  render();
+}
+
 async function handleRealtimeEvent(event: WsServerEvent) {
   if (event.type === 'ready') {
     state.log.unshift(`WebSocket pronto. ${event.pending} envelope(s) pendente(s).`);
@@ -619,20 +719,41 @@ function ensureReady() {
   if (!isReady()) throw new Error('Crie um convite ou entre em uma conversa primeiro.');
 }
 
-function encodeInvite(invite: Invite) {
-  return btoa(JSON.stringify(invite));
+function encodeInviteLink(payload: InviteLinkPayload) {
+  const encoded = btoa(JSON.stringify(payload));
+  return `${window.location.origin}/i/${encodeURIComponent(payload.inviteId)}#zuri=${encoded}`;
 }
 
-function decodeInvite(value: string): Invite {
+function decodeInviteLink(value: string): InviteLinkPayload {
   try {
-    const invite = JSON.parse(atob(value)) as Invite;
-    if (!invite.aToB?.queueId || !invite.bToA?.queueId || !invite.chatKey || !invite.relayUrl) {
+    const hash = value.includes('#') ? value.split('#')[1] : value;
+    const params = new URLSearchParams(hash);
+    const encoded = params.get('zuri') ?? value;
+    const invite = JSON.parse(atob(encoded)) as InviteLinkPayload;
+    if (!invite.inviteId || !invite.inviteSecret || !invite.chatKey || !invite.relayUrl) {
       throw new Error('Convite incompleto.');
     }
     return invite;
   } catch {
-    throw new Error('Convite inválido. Copie o bloco inteiro da outra janela.');
+    throw new Error('Convite inválido. Copie o link inteiro da outra janela.');
   }
+}
+
+function inviteTextFromLocation() {
+  const hash = window.location.hash;
+  if (!hash.includes('zuri=')) return '';
+  return window.location.href;
+}
+
+async function conversationSecurityCode(bundle: RelayConnectionBundle, chatKey: JsonWebKey) {
+  const bytes = new TextEncoder().encode(JSON.stringify({
+    a: bundle.aToB.queueId,
+    b: bundle.bToA.queueId,
+    k: chatKey.k,
+  }));
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  const parts = [digest[0] ?? 0, digest[1] ?? 0, digest[2] ?? 0].map((byte) => String(byte % 100).padStart(2, '0'));
+  return parts.join('-');
 }
 
 async function run(action: () => Promise<void>) {

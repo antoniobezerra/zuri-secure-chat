@@ -1,5 +1,6 @@
 import {
   type LocalPlaintextMessage,
+  type RelayConnectionBundle,
   type WsClientEvent,
   type WsServerEvent,
   localPlaintextMessageSchema,
@@ -51,6 +52,40 @@ export class ZuriSecureRelayClient {
 
   async createQueue() {
     return this.request('/queues', { method: 'POST' });
+  }
+
+  async createInvite() {
+    return this.request('/invites', { method: 'POST' });
+  }
+
+  async acceptInvite(input: { inviteId: string; inviteSecret: string }) {
+    return this.request(`/invites/${encodeURIComponent(input.inviteId)}/accept`, {
+      method: 'POST',
+      body: JSON.stringify({ inviteSecret: input.inviteSecret }),
+      headers: { 'content-type': 'application/json' },
+    }) as Promise<{
+      data: {
+        inviteId: string;
+        status: 'consumed';
+        consumedAt: string;
+        bundle: RelayConnectionBundle;
+      };
+    }>;
+  }
+
+  async claimInvite(input: { inviteId: string; creatorClaimToken: string }) {
+    return this.request(`/invites/${encodeURIComponent(input.inviteId)}/claim`, {
+      method: 'POST',
+      body: JSON.stringify({ creatorClaimToken: input.creatorClaimToken }),
+      headers: { 'content-type': 'application/json' },
+    }) as Promise<{
+      data: {
+        inviteId: string;
+        status: 'consumed';
+        claimedAt: string;
+        bundle: RelayConnectionBundle;
+      };
+    }>;
   }
 
   async enqueue(input: {

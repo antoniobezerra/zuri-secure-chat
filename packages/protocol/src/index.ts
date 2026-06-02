@@ -24,8 +24,53 @@ export const queueCapabilitySchema = z.object({
   createdAt: z.string(),
 });
 
+export const relayConnectionBundleSchema = z.object({
+  aToB: queueCapabilitySchema,
+  bToA: queueCapabilitySchema,
+});
+
 export const createQueueResponseSchema = z.object({
   data: queueCapabilitySchema,
+});
+
+export const inviteStatusSchema = z.enum(['pending', 'consumed', 'expired', 'revoked']);
+export const inviteSecretSchema = z.string().min(32).max(256);
+
+export const createInviteResponseSchema = z.object({
+  data: z.object({
+    inviteId: idSchema,
+    inviteSecret: inviteSecretSchema,
+    creatorClaimToken: inviteSecretSchema,
+    status: inviteStatusSchema,
+    createdAt: z.string(),
+    expiresAt: z.string(),
+  }),
+});
+
+export const acceptInviteInputSchema = z.object({
+  inviteSecret: inviteSecretSchema,
+}).strict();
+
+export const acceptInviteResponseSchema = z.object({
+  data: z.object({
+    inviteId: idSchema,
+    status: z.literal('consumed'),
+    consumedAt: z.string(),
+    bundle: relayConnectionBundleSchema,
+  }),
+});
+
+export const claimInviteInputSchema = z.object({
+  creatorClaimToken: inviteSecretSchema,
+}).strict();
+
+export const claimInviteResponseSchema = z.object({
+  data: z.object({
+    inviteId: idSchema,
+    status: z.literal('consumed'),
+    claimedAt: z.string(),
+    bundle: relayConnectionBundleSchema,
+  }),
 });
 
 export const enqueueMessageInputSchema = z.object({
@@ -186,7 +231,14 @@ export const localPlaintextMessageSchema = z.object({
 
 export type Queue = z.infer<typeof queueSchema>;
 export type QueueCapability = z.infer<typeof queueCapabilitySchema>;
+export type RelayConnectionBundle = z.infer<typeof relayConnectionBundleSchema>;
 export type CreateQueueResponse = z.infer<typeof createQueueResponseSchema>;
+export type InviteStatus = z.infer<typeof inviteStatusSchema>;
+export type CreateInviteResponse = z.infer<typeof createInviteResponseSchema>;
+export type AcceptInviteInput = z.infer<typeof acceptInviteInputSchema>;
+export type AcceptInviteResponse = z.infer<typeof acceptInviteResponseSchema>;
+export type ClaimInviteInput = z.infer<typeof claimInviteInputSchema>;
+export type ClaimInviteResponse = z.infer<typeof claimInviteResponseSchema>;
 export type EnqueueMessageInput = z.infer<typeof enqueueMessageInputSchema>;
 export type QueuedMessage = z.infer<typeof queuedMessageSchema>;
 export type PullMessagesQuery = z.infer<typeof pullMessagesQuerySchema>;
