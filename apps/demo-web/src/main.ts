@@ -145,6 +145,7 @@ bindVaultAutoLock();
 
 function render() {
   const canChat = isReady();
+  const hasBackup = hasVaultBackup();
   const myName = state.role === 'a' ? 'Você: Alice' : state.role === 'b' ? 'Você: Bianca' : 'Sem sessão';
   const peerName = state.role === 'a' ? 'Bianca' : 'Alice';
   const peerSubtitle = canChat
@@ -182,6 +183,12 @@ function render() {
             </label>
             <button id="unlockVault">Desbloquear cofre</button>
           `}
+          <div class="vaultActions">
+            <button class="secondary" id="exportVault" ${hasBackup ? '' : 'disabled'}>Exportar chave</button>
+            <button class="secondary" id="importVault">Importar chave</button>
+            <input class="fileInput" id="importVaultFile" type="file" accept=".zuri-key,application/json" />
+          </div>
+          <small>Exporta só o pacote criptografado. A senha e as chaves abertas não saem do dispositivo.</small>
         </section>
 
         <section class="setupCard">
@@ -302,6 +309,13 @@ function bind() {
     document.querySelector<HTMLInputElement>('#vaultPassword')?.focus();
   });
   document.querySelector<HTMLButtonElement>('#unlockVault')?.addEventListener('click', () => run(unlockVault));
+  document.querySelector<HTMLButtonElement>('#exportVault')?.addEventListener('click', () => run(exportVaultBackupFile));
+  document.querySelector<HTMLButtonElement>('#importVault')?.addEventListener('click', () => {
+    document.querySelector<HTMLInputElement>('#importVaultFile')?.click();
+  });
+  document.querySelector<HTMLInputElement>('#importVaultFile')?.addEventListener('change', (event) => {
+    void run(() => importVaultBackupFile(event));
+  });
   document.querySelector<HTMLButtonElement>('#lockVault')?.addEventListener('click', () => {
     if (state.vaultUnlocked) lockVault('Cofre bloqueado manualmente.');
   });
@@ -441,6 +455,42 @@ async function unlockVault() {
 async function persistStorage() {
   const persisted = await requestPersistentStorage();
   state.log.unshift(`Storage persistente: ${persisted ? 'aceito pelo navegador' : 'não garantido pelo navegador'}.`);
+}
+
+async function exportVaultBackupFile() {
+  const backup = state.backup ?? readVaultBackupFromStorage();
+  if (!backup) throw new Error('Nenhum cofre local encontrado para exportar.');
+
+  const text = `${JSON.stringify(backup, null, 2)}\n`;
+  const blob = new Blob([text], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  const date = new Date().toISOString().slice(0, 10);
+  link.href = url;
+  link.download = `zuri-vault-${date}.zuri-key`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  state.log.unshift('Backup criptografado exportado em arquivo .zuri-key.');
+}
+
+async function importVaultBackupFile(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+
+  try {
+    const backup = parseVaultBackup(await file.text());
+    localStorage.setItem(vaultBackupKey, JSON.stringify(backup));
+    if (state.vaultUnlocked) {
+      lockVault('Cofre bloqueado para carregar o backup importado.');
+    }
+    state.backup = backup;
+    state.log.unshift('Backup importado. Digite a senha desse arquivo para desbloquear.');
+  } finally {
+    input.value = '';
+  }
 }
 
 async function copyInvite() {
@@ -852,6 +902,54 @@ function validateVaultPassword(password: string) {
   if (password.length < vaultPasswordMinLength || classes < 3) {
     throw new Error(`Use uma senha com pelo menos ${vaultPasswordMinLength} caracteres e 3 tipos de caracteres.`);
   }
+}
+
+function hasVaultBackup() {
+  return Boolean(state.backup ?? localStorage.getItem(vaultBackupKey));
+}
+
+function readVaultBackupFromStorage() {
+  const stored = localStorage.getItem(vaultBackupKey);
+  if (!stored) return undefined;
+  return parseVaultBackup(stored);
+}
+
+function parseVaultBackup(text: string): VaultBackup {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error('Arquivo .zuri-key inválido: JSON não reconhecido.');
+  }
+  return validateVaultBackupShape(parsed);
+}
+
+function validateVaultBackupShape(value: unknown): VaultBackup {
+  if (!value || typeof value !== 'object') {
+    throw new Error('Arquivo .zuri-key inválido: estrutura ausente.');
+  }
+  const backup = value as Partial<VaultBackup>;
+  const requiredStringFields = [
+    'salt',
+    'nonce',
+    'encryptedPrivateKey',
+    'encryptedHistoryKey',
+    'createdAt',
+  ] as const;
+  const hasRequiredStrings = requiredStringFields.every((field) => typeof backup[field] === 'string' && backup[field]);
+  if (
+    backup.version !== 1 ||
+    backup.kdf !== 'PBKDF2-SHA256' ||
+    typeof backup.iterations !== 'number' ||
+    !Number.isFinite(backup.iterations) ||
+    backup.iterations < 100000 ||
+    !hasRequiredStrings ||
+    !backup.publicKey ||
+    typeof backup.publicKey !== 'object'
+  ) {
+    throw new Error('Arquivo .zuri-key inválido ou incompatível com este app.');
+  }
+  return backup as VaultBackup;
 }
 
 function encodeInviteLink(payload: InviteLinkPayload) {

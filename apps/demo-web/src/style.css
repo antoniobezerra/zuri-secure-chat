@@ -254,6 +254,11 @@ li {
   font-size: 0.84rem;
 }
 
+.vaultCard small {
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
 .vaultCard.unlocked .sectionTitle span {
   background: rgba(24, 199, 160, 0.13);
   border-color: rgba(24, 199, 160, 0.3);
@@ -372,9 +377,22 @@ textarea {
 }
 
 .setupActions,
+.vaultActions,
 .chatTopActions {
   display: flex;
   gap: 8px;
+}
+
+.vaultActions {
+  flex-wrap: wrap;
+}
+
+.vaultActions button {
+  flex: 1 1 132px;
+}
+
+.fileInput {
+  display: none;
 }
 
 .contactList {
