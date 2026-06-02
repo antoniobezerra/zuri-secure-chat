@@ -39,6 +39,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -307,6 +308,7 @@ label {
 }
 
 input,
+select,
 textarea {
   width: 100%;
   border: 1px solid var(--line-strong);
@@ -322,10 +324,30 @@ textarea {
 }
 
 input:focus,
+select:focus,
 textarea:focus {
   background: rgba(20, 20, 19, 0.96);
   border-color: rgba(24, 199, 160, 0.58);
   box-shadow: 0 0 0 3px rgba(24, 199, 160, 0.1);
+}
+
+.vaultEmpty {
+  background: rgba(244, 240, 232, 0.055);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 4px;
+  padding: 11px;
+}
+
+.vaultEmpty strong {
+  color: var(--text);
+  font-size: 0.86rem;
+}
+
+.vaultEmpty span {
+  color: var(--muted);
+  font-size: 0.8rem;
 }
 
 .passwordField {
@@ -378,9 +400,29 @@ textarea {
 
 .setupActions,
 .vaultActions,
+.vaultTabs,
 .chatTopActions {
   display: flex;
   gap: 8px;
+}
+
+.vaultTabs {
+  background: rgba(16, 16, 15, 0.62);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 4px;
+}
+
+.vaultTabs button {
+  flex: 1;
+  min-height: 34px;
+  padding: 7px 10px;
+}
+
+.vaultTabs button.active {
+  background: rgba(24, 199, 160, 0.14);
+  border-color: rgba(24, 199, 160, 0.34);
+  color: #a9f7df;
 }
 
 .vaultActions {

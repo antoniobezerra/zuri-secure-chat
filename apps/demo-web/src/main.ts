@@ -86,12 +86,24 @@ type RelayOverview = {
   }>;
 };
 
+type VaultRecord = {
+  id: string;
+  name: string;
+  storageKey: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type AppState = {
   relayUrl: string;
   adminToken: string;
   vaultUnlocked: boolean;
   vaultPasswordInput: string;
   vaultPasswordVisible: boolean;
+  vaultMode: 'unlock' | 'create';
+  vaultNameInput: string;
+  vaults: VaultRecord[];
+  selectedVaultId?: string;
   role: Role | null;
   inviteText: string;
   messageText: string;
@@ -109,13 +121,17 @@ type AppState = {
   pendingInvite?: PendingInvite;
 };
 
-const vaultBackupKey = 'zuri-secure-chat:vault-backup';
+const legacyVaultBackupKey = 'zuri-secure-chat:vault-backup';
+const vaultRegistryKey = 'zuri-secure-chat:vaults';
+const activeVaultIdKey = 'zuri-secure-chat:active-vault-id';
+const vaultStorageKeyPrefix = 'zuri-secure-chat:vault:';
 const vaultPasswordMinLength = 14;
 
 let pollTimer: number | undefined;
 let claimTimer: number | undefined;
 let realtimeClient: ZuriSecureRealtimeClient | undefined;
 const sentStatuses = new Map<string, 'sending' | 'stored' | 'delivered'>();
+const initialVaults = loadVaultRegistry();
 
 function defaultRelayUrl() {
   const configured = import.meta.env.VITE_RELAY_URL as string | undefined;
@@ -130,6 +146,10 @@ const state: AppState = {
   vaultUnlocked: false,
   vaultPasswordInput: '',
   vaultPasswordVisible: false,
+  vaultMode: initialVaults.length ? 'unlock' : 'create',
+  vaultNameInput: 'Meu cofre',
+  vaults: initialVaults,
+  selectedVaultId: loadActiveVaultId(initialVaults),
   role: null,
   inviteText: inviteTextFromLocation(),
   messageText: '',
@@ -146,6 +166,7 @@ bindVaultAutoLock();
 function render() {
   const canChat = isReady();
   const hasBackup = hasVaultBackup();
+  const selectedVault = getSelectedVault();
   const myName = state.role === 'a' ? 'Você: Alice' : state.role === 'b' ? 'Você: Bianca' : 'Sem sessão';
   const peerName = state.role === 'a' ? 'Bianca' : 'Alice';
   const peerSubtitle = canChat
@@ -166,12 +187,43 @@ function render() {
 
         <section class="vaultCard ${state.vaultUnlocked ? 'unlocked' : ''}">
           <div class="sectionTitle">
-            <h2>Cofre local</h2>
+            <h2>Cofres locais</h2>
             <span>${state.vaultUnlocked ? 'Aberto' : 'Bloqueado'}</span>
           </div>
-          <p>${state.vaultUnlocked ? 'Chaves carregadas só na memória desta sessão.' : 'Digite sua senha local para liberar chaves e histórico.'}</p>
+          <p>${state.vaultUnlocked ? `Cofre ${escapeHtml(selectedVault?.name ?? 'local')} aberto. Chaves carregadas só na memória desta sessão.` : 'Crie ou escolha um cofre antes de abrir o ambiente de conversa.'}</p>
+          ${state.vaults.length ? `
+            <label>Cofre
+              <select id="vaultSelect" ${state.vaultUnlocked ? 'disabled' : ''}>
+                ${state.vaults.map((vault) => `
+                  <option value="${escapeHtml(vault.id)}" ${vault.id === state.selectedVaultId ? 'selected' : ''}>${escapeHtml(vault.name)}</option>
+                `).join('')}
+              </select>
+            </label>
+            <div class="vaultTabs">
+              <button class="ghost ${state.vaultMode === 'unlock' ? 'active' : ''}" id="showUnlockVault" ${state.vaultUnlocked ? 'disabled' : ''}>Abrir</button>
+              <button class="ghost ${state.vaultMode === 'create' ? 'active' : ''}" id="showCreateVault" ${state.vaultUnlocked ? 'disabled' : ''}>Novo cofre</button>
+            </div>
+          ` : `
+            <div class="vaultEmpty">
+              <strong>Nenhum cofre criado</strong>
+              <span>O chat só abre depois que você cria o primeiro cofre local.</span>
+            </div>
+          `}
           ${state.vaultUnlocked ? `
             <button class="secondary" id="persist">Guardar storage do navegador</button>
+          ` : state.vaultMode === 'create' ? `
+            <label>Nome do cofre
+              <input id="vaultName" autocomplete="off" placeholder="Ex: Cofre pessoal" value="${escapeHtml(state.vaultNameInput)}" />
+            </label>
+            <label>Senha do novo cofre
+              <span class="passwordField">
+                <input id="vaultPassword" type="${state.vaultPasswordVisible ? 'text' : 'password'}" autocomplete="off" placeholder="Mínimo ${vaultPasswordMinLength} caracteres" value="${escapeHtml(state.vaultPasswordInput)}" />
+                <button class="passwordToggle" id="toggleVaultPassword" type="button" aria-label="${state.vaultPasswordVisible ? 'Ocultar senha' : 'Mostrar senha'}" title="${state.vaultPasswordVisible ? 'Ocultar senha' : 'Mostrar senha'}">
+                  ${renderEyeIcon(state.vaultPasswordVisible)}
+                </button>
+              </span>
+            </label>
+            <button id="createVault">Criar e abrir cofre</button>
           ` : `
             <label>Senha do cofre
               <span class="passwordField">
@@ -181,7 +233,7 @@ function render() {
                 </button>
               </span>
             </label>
-            <button id="unlockVault">Desbloquear cofre</button>
+            <button id="unlockVault" ${selectedVault ? '' : 'disabled'}>Abrir cofre</button>
           `}
           <div class="vaultActions">
             <button class="secondary" id="exportVault" ${hasBackup ? '' : 'disabled'}>Exportar chave</button>
@@ -294,20 +346,42 @@ function renderContact(name: string, kind: string, active: boolean, meta: string
 }
 
 function bind() {
+  document.querySelector<HTMLSelectElement>('#vaultSelect')?.addEventListener('change', (event) => {
+    state.selectedVaultId = (event.target as HTMLSelectElement).value;
+    localStorage.setItem(activeVaultIdKey, state.selectedVaultId);
+    state.backup = undefined;
+    state.vaultPasswordInput = '';
+    state.vaultMode = 'unlock';
+    render();
+  });
+  document.querySelector<HTMLInputElement>('#vaultName')?.addEventListener('input', (event) => {
+    state.vaultNameInput = (event.target as HTMLInputElement).value;
+  });
   document.querySelector<HTMLInputElement>('#vaultPassword')?.addEventListener('input', (event) => {
     state.vaultPasswordInput = (event.target as HTMLInputElement).value;
   });
   document.querySelector<HTMLInputElement>('#vaultPassword')?.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') {
       event.preventDefault();
-      void run(unlockVault);
+      void run(state.vaultMode === 'create' ? createVault : unlockVault);
     }
+  });
+  document.querySelector<HTMLButtonElement>('#showUnlockVault')?.addEventListener('click', () => {
+    state.vaultMode = 'unlock';
+    state.vaultPasswordInput = '';
+    render();
+  });
+  document.querySelector<HTMLButtonElement>('#showCreateVault')?.addEventListener('click', () => {
+    state.vaultMode = 'create';
+    state.vaultPasswordInput = '';
+    render();
   });
   document.querySelector<HTMLButtonElement>('#toggleVaultPassword')?.addEventListener('click', () => {
     state.vaultPasswordVisible = !state.vaultPasswordVisible;
     render();
     document.querySelector<HTMLInputElement>('#vaultPassword')?.focus();
   });
+  document.querySelector<HTMLButtonElement>('#createVault')?.addEventListener('click', () => run(createVault));
   document.querySelector<HTMLButtonElement>('#unlockVault')?.addEventListener('click', () => run(unlockVault));
   document.querySelector<HTMLButtonElement>('#exportVault')?.addEventListener('click', () => run(exportVaultBackupFile));
   document.querySelector<HTMLButtonElement>('#importVault')?.addEventListener('click', () => {
@@ -419,8 +493,45 @@ async function joinInvite() {
 async function setupLocalVault() {
   if (state.db && state.historyKey) return;
   if (!state.vaultUnlocked) {
-    throw new Error('Desbloqueie o cofre local antes de abrir ou criar conversa.');
+    throw new Error('Abra um cofre local antes de criar ou entrar em conversa.');
   }
+}
+
+async function createVault() {
+  const password = state.vaultPasswordInput;
+  const name = state.vaultNameInput.trim();
+  validateVaultPassword(password);
+  if (!name) throw new Error('Dê um nome para o cofre.');
+  if (!crypto.subtle) {
+    throw new Error('Seu navegador bloqueou a criação de chaves neste endereço. Abra pela URL HTTPS da Zuri.');
+  }
+
+  const device = await generateDeviceKeyPair();
+  const historyKey = await generateHistoryKey();
+  const backup = await exportZuriKeyBackup(password, device, historyKey);
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+  const vault: VaultRecord = {
+    id,
+    name,
+    storageKey: `${vaultStorageKeyPrefix}${id}:backup`,
+    createdAt: now,
+    updatedAt: now,
+  };
+  localStorage.setItem(vault.storageKey, JSON.stringify(backup));
+  state.vaults = [...state.vaults, vault];
+  saveVaultRegistry(state.vaults);
+  state.selectedVaultId = id;
+  localStorage.setItem(activeVaultIdKey, id);
+  state.backup = backup;
+  state.historyKey = historyKey;
+  state.db = await openLocalHistoryDb();
+  state.vaultUnlocked = true;
+  state.vaultMode = 'unlock';
+  state.vaultNameInput = 'Meu cofre';
+  state.vaultPasswordInput = '';
+  state.vaultPasswordVisible = false;
+  state.log.unshift(`Cofre ${name} criado e aberto. A senha não foi salva.`);
 }
 
 async function unlockVault() {
@@ -430,26 +541,20 @@ async function unlockVault() {
     throw new Error('Seu navegador bloqueou a criação de chaves neste endereço. Abra pela URL HTTPS da Zuri.');
   }
 
-  const storedBackup = localStorage.getItem(vaultBackupKey);
+  const selectedVault = getSelectedVault();
+  if (!selectedVault) throw new Error('Escolha um cofre para abrir.');
+  const storedBackup = localStorage.getItem(selectedVault.storageKey);
+  if (!storedBackup) throw new Error('Backup deste cofre não foi encontrado neste navegador.');
   const db = await openLocalHistoryDb();
-  if (storedBackup) {
-    const backup = JSON.parse(storedBackup) as VaultBackup;
-    const imported = await importZuriKeyBackup(password, backup);
-    state.backup = backup;
-    state.historyKey = imported.historyKey;
-  } else {
-    const device = await generateDeviceKeyPair();
-    const historyKey = await generateHistoryKey();
-    const backup = await exportZuriKeyBackup(password, device, historyKey);
-    localStorage.setItem(vaultBackupKey, JSON.stringify(backup));
-    state.backup = backup;
-    state.historyKey = historyKey;
-  }
+  const backup = parseVaultBackup(storedBackup);
+  const imported = await importZuriKeyBackup(password, backup);
+  state.backup = backup;
+  state.historyKey = imported.historyKey;
   state.db = db;
   state.vaultUnlocked = true;
   state.vaultPasswordInput = '';
   state.vaultPasswordVisible = false;
-  state.log.unshift('Cofre local desbloqueado. A senha não foi salva.');
+  state.log.unshift(`Cofre ${selectedVault.name} aberto. A senha não foi salva.`);
 }
 
 async function persistStorage() {
@@ -482,12 +587,26 @@ async function importVaultBackupFile(event: Event) {
 
   try {
     const backup = parseVaultBackup(await file.text());
-    localStorage.setItem(vaultBackupKey, JSON.stringify(backup));
     if (state.vaultUnlocked) {
-      lockVault('Cofre bloqueado para carregar o backup importado.');
+      closeVaultSession('Cofre bloqueado para carregar o backup importado.');
     }
+    const now = new Date().toISOString();
+    const id = crypto.randomUUID();
+    const vault: VaultRecord = {
+      id,
+      name: `Cofre importado ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
+      storageKey: `${vaultStorageKeyPrefix}${id}:backup`,
+      createdAt: now,
+      updatedAt: now,
+    };
+    localStorage.setItem(vault.storageKey, JSON.stringify(backup));
+    state.vaults = [...state.vaults, vault];
+    saveVaultRegistry(state.vaults);
+    state.selectedVaultId = id;
+    localStorage.setItem(activeVaultIdKey, id);
     state.backup = backup;
-    state.log.unshift('Backup importado. Digite a senha desse arquivo para desbloquear.');
+    state.vaultMode = 'unlock';
+    state.log.unshift('Backup importado como novo cofre. Digite a senha desse arquivo para abrir.');
   } finally {
     input.value = '';
   }
@@ -717,6 +836,11 @@ function syncRealtime() {
 }
 
 function lockVault(reason = 'Cofre local bloqueado.') {
+  closeVaultSession(reason);
+  render();
+}
+
+function closeVaultSession(reason = 'Cofre local bloqueado.') {
   realtimeClient?.close();
   realtimeClient = undefined;
   if (claimTimer) window.clearInterval(claimTimer);
@@ -734,7 +858,6 @@ function lockVault(reason = 'Cofre local bloqueado.') {
   state.role = null;
   state.messageText = '';
   state.log.unshift(reason);
-  render();
 }
 
 function bindVaultAutoLock() {
@@ -904,12 +1027,63 @@ function validateVaultPassword(password: string) {
   }
 }
 
+function loadVaultRegistry(): VaultRecord[] {
+  const stored = localStorage.getItem(vaultRegistryKey);
+  if (stored) {
+    try {
+      const parsed = JSON.parse(stored) as VaultRecord[];
+      if (Array.isArray(parsed)) {
+        return parsed.filter((vault) => (
+          vault &&
+          typeof vault.id === 'string' &&
+          typeof vault.name === 'string' &&
+          typeof vault.storageKey === 'string'
+        ));
+      }
+    } catch {
+      return [];
+    }
+  }
+
+  if (localStorage.getItem(legacyVaultBackupKey)) {
+    const now = new Date().toISOString();
+    const legacyVault: VaultRecord = {
+      id: 'principal',
+      name: 'Cofre principal',
+      storageKey: legacyVaultBackupKey,
+      createdAt: now,
+      updatedAt: now,
+    };
+    saveVaultRegistry([legacyVault]);
+    localStorage.setItem(activeVaultIdKey, legacyVault.id);
+    return [legacyVault];
+  }
+
+  return [];
+}
+
+function saveVaultRegistry(vaults: VaultRecord[]) {
+  localStorage.setItem(vaultRegistryKey, JSON.stringify(vaults));
+}
+
+function loadActiveVaultId(vaults: VaultRecord[]) {
+  const activeId = localStorage.getItem(activeVaultIdKey);
+  if (activeId && vaults.some((vault) => vault.id === activeId)) return activeId;
+  return vaults[0]?.id;
+}
+
+function getSelectedVault() {
+  return state.vaults.find((vault) => vault.id === state.selectedVaultId);
+}
+
 function hasVaultBackup() {
-  return Boolean(state.backup ?? localStorage.getItem(vaultBackupKey));
+  const selectedVault = getSelectedVault();
+  return Boolean(state.backup ?? (selectedVault ? localStorage.getItem(selectedVault.storageKey) : undefined));
 }
 
 function readVaultBackupFromStorage() {
-  const stored = localStorage.getItem(vaultBackupKey);
+  const selectedVault = getSelectedVault();
+  const stored = selectedVault ? localStorage.getItem(selectedVault.storageKey) : undefined;
   if (!stored) return undefined;
   return parseVaultBackup(stored);
 }
