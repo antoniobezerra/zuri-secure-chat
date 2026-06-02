@@ -4,6 +4,7 @@ import {
   exportZuriKeyBackup,
   generateDeviceKeyPair,
   generateHistoryKey,
+  importZuriKeyBackup,
   listLocalMessages,
   openLocalHistoryDb,
   requestPersistentStorage,
@@ -88,6 +89,8 @@ type RelayOverview = {
 type AppState = {
   relayUrl: string;
   adminToken: string;
+  vaultUnlocked: boolean;
+  vaultPasswordInput: string;
   role: Role | null;
   inviteText: string;
   messageText: string;
@@ -105,6 +108,9 @@ type AppState = {
   pendingInvite?: PendingInvite;
 };
 
+const vaultBackupKey = 'zuri-secure-chat:vault-backup';
+const vaultPasswordMinLength = 14;
+
 let pollTimer: number | undefined;
 let claimTimer: number | undefined;
 let realtimeClient: ZuriSecureRealtimeClient | undefined;
@@ -120,6 +126,8 @@ function defaultRelayUrl() {
 const state: AppState = {
   relayUrl: defaultRelayUrl(),
   adminToken: 'zuri-demo-admin',
+  vaultUnlocked: false,
+  vaultPasswordInput: '',
   role: null,
   inviteText: inviteTextFromLocation(),
   messageText: '',
@@ -131,6 +139,7 @@ const state: AppState = {
 
 render();
 syncRealtime();
+bindVaultAutoLock();
 
 function render() {
   const canChat = isReady();
@@ -149,8 +158,24 @@ function render() {
             <strong>Zuri Chat</strong>
             <span>A segurança é nossa. A conversa é sua.</span>
           </div>
-          <button class="iconButton" id="persist" title="Guardar melhor neste navegador">↧</button>
+          <button class="iconButton" id="lockVault" title="${state.vaultUnlocked ? 'Bloquear cofre local' : 'Cofre bloqueado'}">${state.vaultUnlocked ? '×' : '⌁'}</button>
         </header>
+
+        <section class="vaultCard ${state.vaultUnlocked ? 'unlocked' : ''}">
+          <div class="sectionTitle">
+            <h2>Cofre local</h2>
+            <span>${state.vaultUnlocked ? 'Aberto' : 'Bloqueado'}</span>
+          </div>
+          <p>${state.vaultUnlocked ? 'Chaves carregadas só na memória desta sessão.' : 'Digite sua senha local para liberar chaves e histórico.'}</p>
+          ${state.vaultUnlocked ? `
+            <button class="secondary" id="persist">Guardar storage do navegador</button>
+          ` : `
+            <label>Senha do cofre
+              <input id="vaultPassword" type="password" autocomplete="off" placeholder="Mínimo ${vaultPasswordMinLength} caracteres" value="${escapeHtml(state.vaultPasswordInput)}" />
+            </label>
+            <button id="unlockVault">Desbloquear cofre</button>
+          `}
+        </section>
 
         <section class="setupCard">
           <div class="sectionTitle">
@@ -162,13 +187,13 @@ function render() {
             <input id="relayUrl" value="${escapeHtml(state.relayUrl)}" />
           </label>
           <div class="setupActions">
-            <button id="createInvite">Criar convite</button>
+            <button id="createInvite" ${state.vaultUnlocked ? '' : 'disabled'}>Criar convite</button>
             <button class="secondary" id="copyInvite" ${state.inviteText ? '' : 'disabled'}>Copiar</button>
           </div>
           <label>Convite recebido
             <textarea id="inviteInput" placeholder="Cole aqui o link one-time da outra pessoa">${escapeHtml(state.inviteText)}</textarea>
           </label>
-          <button class="secondary" id="joinInvite">Entrar na conversa</button>
+          <button class="secondary" id="joinInvite" ${state.vaultUnlocked ? '' : 'disabled'}>Entrar na conversa</button>
         </section>
 
         <section class="contactList" aria-label="Contatos">
@@ -255,6 +280,19 @@ function renderContact(name: string, kind: string, active: boolean, meta: string
 }
 
 function bind() {
+  document.querySelector<HTMLInputElement>('#vaultPassword')?.addEventListener('input', (event) => {
+    state.vaultPasswordInput = (event.target as HTMLInputElement).value;
+  });
+  document.querySelector<HTMLInputElement>('#vaultPassword')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void run(unlockVault);
+    }
+  });
+  document.querySelector<HTMLButtonElement>('#unlockVault')?.addEventListener('click', () => run(unlockVault));
+  document.querySelector<HTMLButtonElement>('#lockVault')?.addEventListener('click', () => {
+    if (state.vaultUnlocked) lockVault('Cofre bloqueado manualmente.');
+  });
   document.querySelector<HTMLInputElement>('#relayUrl')?.addEventListener('input', (event) => {
     state.relayUrl = (event.target as HTMLInputElement).value;
   });
@@ -354,17 +392,37 @@ async function joinInvite() {
 
 async function setupLocalVault() {
   if (state.db && state.historyKey) return;
+  if (!state.vaultUnlocked) {
+    throw new Error('Desbloqueie o cofre local antes de abrir ou criar conversa.');
+  }
+}
+
+async function unlockVault() {
+  const password = state.vaultPasswordInput;
+  validateVaultPassword(password);
   if (!crypto.subtle) {
     throw new Error('Seu navegador bloqueou a criação de chaves neste endereço. Abra pela URL HTTPS da Zuri.');
   }
 
-  const device = await generateDeviceKeyPair();
-  const historyKey = await generateHistoryKey();
+  const storedBackup = localStorage.getItem(vaultBackupKey);
   const db = await openLocalHistoryDb();
-  state.backup = await exportZuriKeyBackup('demo-local-password', device, historyKey);
-  state.historyKey = historyKey;
+  if (storedBackup) {
+    const backup = JSON.parse(storedBackup) as VaultBackup;
+    const imported = await importZuriKeyBackup(password, backup);
+    state.backup = backup;
+    state.historyKey = imported.historyKey;
+  } else {
+    const device = await generateDeviceKeyPair();
+    const historyKey = await generateHistoryKey();
+    const backup = await exportZuriKeyBackup(password, device, historyKey);
+    localStorage.setItem(vaultBackupKey, JSON.stringify(backup));
+    state.backup = backup;
+    state.historyKey = historyKey;
+  }
   state.db = db;
-  state.log.unshift('Cofre local criado neste navegador.');
+  state.vaultUnlocked = true;
+  state.vaultPasswordInput = '';
+  state.log.unshift('Cofre local desbloqueado. A senha não foi salva.');
 }
 
 async function persistStorage() {
@@ -595,6 +653,32 @@ function syncRealtime() {
   realtimeClient.connect();
 }
 
+function lockVault(reason = 'Cofre local bloqueado.') {
+  realtimeClient?.close();
+  realtimeClient = undefined;
+  if (claimTimer) window.clearInterval(claimTimer);
+  claimTimer = undefined;
+  state.vaultUnlocked = false;
+  state.vaultPasswordInput = '';
+  state.realtimeStatus = 'offline';
+  state.historyKey = undefined;
+  state.chatKey = undefined;
+  state.db?.close();
+  state.db = undefined;
+  state.invite = undefined;
+  state.pendingInvite = undefined;
+  state.role = null;
+  state.messageText = '';
+  state.log.unshift(reason);
+  render();
+}
+
+function bindVaultAutoLock() {
+  window.addEventListener('pagehide', () => {
+    if (state.vaultUnlocked) lockVault('Cofre bloqueado ao sair da página.');
+  });
+}
+
 function syncClaiming() {
   if (claimTimer) {
     window.clearInterval(claimTimer);
@@ -722,6 +806,18 @@ function isReady() {
 
 function ensureReady() {
   if (!isReady()) throw new Error('Crie um convite ou entre em uma conversa primeiro.');
+}
+
+function validateVaultPassword(password: string) {
+  const classes = [
+    /[a-z]/.test(password),
+    /[A-Z]/.test(password),
+    /[0-9]/.test(password),
+    /[^A-Za-z0-9]/.test(password),
+  ].filter(Boolean).length;
+  if (password.length < vaultPasswordMinLength || classes < 3) {
+    throw new Error(`Use uma senha com pelo menos ${vaultPasswordMinLength} caracteres e 3 tipos de caracteres.`);
+  }
 }
 
 function encodeInviteLink(payload: InviteLinkPayload) {

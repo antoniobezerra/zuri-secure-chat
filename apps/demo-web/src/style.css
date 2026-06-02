@@ -227,12 +227,37 @@ li {
   width: 38px;
 }
 
+.vaultCard,
 .setupCard,
 .opsPanel,
 .logPanel {
   display: grid;
   gap: 12px;
   padding: 15px;
+}
+
+.vaultCard {
+  background:
+    linear-gradient(180deg, rgba(186, 111, 143, 0.075), transparent 62%),
+    var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.vaultCard.unlocked {
+  background:
+    linear-gradient(180deg, rgba(24, 199, 160, 0.08), transparent 62%),
+    var(--panel);
+}
+
+.vaultCard p {
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.vaultCard.unlocked .sectionTitle span {
+  background: rgba(24, 199, 160, 0.13);
+  border-color: rgba(24, 199, 160, 0.3);
+  color: #92f1d9;
 }
 
 .setupCard {
